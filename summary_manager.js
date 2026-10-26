@@ -308,7 +308,7 @@
         let changed = false;
         for (let position = 0; position < dialogue.length; position++) {
             const { msg, i } = dialogue[position];
-            const shouldHide = i !== 0 && (position < cutoff || i < summaryEnd);
+            const shouldHide = position < cutoff || i < summaryEnd;
             let marker = msg.extra?.gaigai_visibility;
             if (shouldHide && !marker) {
                 msg.extra = msg.extra || {};

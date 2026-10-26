@@ -245,7 +245,7 @@ test('60 to 40 branch recalculates keep-10 hiding and preserves manual hides wit
     ctx.chat[55].is_system = true; // user-owned hide outside the automatic range
     const token = app.captureHistoryToken();
     app.syncMemoryHistory();
-    assert.equal(ctx.chat[0].is_system, undefined, 'opening message remains pinned');
+    assert.equal(ctx.chat[0].is_system, true, 'opening message follows the same hiding rule');
     assert.equal(ctx.chat[49].is_system, true);
     assert.equal(!!ctx.chat[50].is_system, false);
     assert.equal(app.isHistoryTokenCurrent(token), true, 'hiding is not a content edit');
@@ -261,6 +261,7 @@ test('60 to 40 branch recalculates keep-10 hiding and preserves manual hides wit
     app.m.load();
     app.config_obj.contextLimit = false;
     app.syncMemoryHistory();
+    assert.equal(ctx.chat[0].is_system, false, 'automatic opening-message hide can be undone');
     assert.equal(ctx.chat[10].is_system, false, 'plugin hides can be undone');
     assert.equal(ctx.chat[55].is_system, true, 'manual hides remain');
 });
@@ -363,7 +364,7 @@ test('legacy hidden prefix is adopted so an old 60-floor archive can show its la
     assert.equal(ctx.chat[29].is_system, true);
     assert.equal(ctx.chat[30].is_system, false);
     assert.equal(ctx.chat[39].is_system, false);
-    assert.equal(ctx.chat[0].is_system, false);
+    assert.equal(ctx.chat[0].is_system, true);
 });
 
 test('late historical edits keep later append operations in source-floor order', () => {
