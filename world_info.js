@@ -23,23 +23,24 @@
         }
 
         /**
-         * 🧼 [辅助方法] 获取稳定的世界书名称 (去除 Branch 后缀)
-         * 目的：让主线和所有分支共用同一个世界书文件，防止文件爆炸
+         * 获取每个对话/分支独立的世界书名称；自定义名称只作为显示前缀。
          */
         _getStableBookName(gid) {
+            // Custom names are display prefixes; every chat/branch still owns its own file.
+            const suffix = window.Gaigai.History.fingerprint(String(gid || '')).replace(/:/g, '_');
             // ✅ 检查是否有自定义书名
             if (window.Gaigai && window.Gaigai.m && window.Gaigai.m.wiConfig && window.Gaigai.m.wiConfig.bookName) {
                 const customName = window.Gaigai.m.wiConfig.bookName.trim();
                 if (customName) {
                     console.log(`📚 [世界书] 使用自定义名称: ${customName}`);
-                    return customName;
+                    return `${customName}_${suffix}`;
                 }
             }
 
             // ⚙️ 使用默认自动生成的名称
             if (!gid) return "Memory_Context_Unknown";
-            // 移除 _Branch 及其后面的所有内容
-            const stableId = gid.split('_Branch')[0];
+            // Hash the full chat identity, including its branch name.
+            const stableId = suffix;
             const safeName = stableId.replace(/[\\/:*?"<>|]/g, "_");
             return "Memory_Context_" + safeName;
         }
@@ -51,8 +52,12 @@
          * @param {string} csrfToken - CSRF令牌
          * @returns {Promise<Object>} - 同步结果 {mode: 'create'|'update'|'error', success: boolean}
          */
-        async smartSyncWorldInfo(worldBookName, importEntries, csrfToken) {
+        async smartSyncWorldInfo(worldBookName, importEntries, csrfToken, historyToken) {
             try {
+                if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) return { mode: 'stale', success: false };
+                for (const entry of Object.values(importEntries)) {
+                    entry.extensions = { ...entry.extensions, gaigai_memory: { session: historyToken.session } };
+                }
                 // 步骤1：检查书是否已存在
                 let bookExists = false;
 
@@ -135,6 +140,7 @@
                 console.warn('⚠️ [世界书同步] m 对象不存在，跳过同步');
                 return Promise.resolve();
             }
+            const historyToken = window.Gaigai.captureHistoryToken();
 
             // 2. 防抖：重置倒计时
             if (this.syncDebounceTimer) {
@@ -149,20 +155,22 @@
                     // 这里的 5000ms 不仅是为了防文件锁，更是为了让数据彻底落稳
                     console.log('⏳ [IO缓冲] 等待 5秒，确保数据完整并释放锁...');
                     await new Promise(r => setTimeout(r, 5000));
+                    if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) return;
 
                     // ==================== 🔀 模式分支 ====================
                     if (isForce) {
                         // 📋 强制覆盖模式：读取整个总结表，完全覆盖世界书
                         console.log('🔥 [世界书同步] 模式：强制覆盖（镜像全表）');
-                        await this._syncFullTable(m, C);
+                        await this._syncFullTable(m, C, historyToken);
                     } else if (content && content.trim()) {
                         // ➕ 追加模式：仅追加单条内容，不影响现有条目
                         console.log('➕ [世界书同步] 模式：追加新内容');
-                        await this._syncAppendContent(content, m, C);
+                        // Journal state is authoritative; mirroring also removes rolled-back summaries.
+                        await this._syncFullTable(m, C, historyToken);
                     } else {
                         // 🔄 默认行为：如果没有 content 且未强制覆盖，读取表格同步
                         console.log('🔄 [世界书同步] 模式：默认（读取表格镜像）');
-                        await this._syncFullTable(m, C);
+                        await this._syncFullTable(m, C, historyToken);
                     }
 
                 } catch (error) {
@@ -177,12 +185,12 @@
          * 🔥 私有方法：强制覆盖模式（读取整个总结表，覆盖世界书）
          * @private
          */
-        async _syncFullTable(m, C) {
+        async _syncFullTable(m, C, historyToken) {
             try {
                 // 🔄 步骤 B: 等待结束后，再获取表格数据！(关键修改)
                 // 这样能确保我们读到的是等待结束后的最新、最全的数据
                 const summarySheet = m.get(m.s.length - 1); // 动态获取最后一个表格（总结表）
-                if (!summarySheet || summarySheet.r.length === 0) {
+                if (!summarySheet) {
                     console.log('⚠️ [世界书同步] 表格为空，跳过');
                     return;
                 }
@@ -323,7 +331,8 @@
 
                 // --- 5. 智能同步 (自动判断创建/更新，防止幽灵条目) ---
                 console.log('⚡ [世界书同步-覆盖] 准备智能同步，条目数:', Object.keys(importEntries).length);
-                const syncResult = await this.smartSyncWorldInfo(worldBookName, importEntries, csrfToken);
+                const syncResult = await this.smartSyncWorldInfo(worldBookName, importEntries, csrfToken, historyToken);
+                if (!syncResult.success || !window.Gaigai.isHistoryTokenCurrent(historyToken)) return;
 
                 // 更新缓存
                 this.globalWorldInfoEntriesCache = importEntries;
@@ -336,13 +345,14 @@
 
                     // 📢 提示用户手动绑定世界书
                     if (typeof toastr !== 'undefined') {
-                        toastr.info(`世界书 "${worldBookName}" 已创建，请手动在角色卡中绑定`, '世界书同步', { timeOut: 5000 });
+                        toastr.info(`世界书 "${worldBookName}" 已创建，请在当前聊天的世界书设置中绑定`, '世界书同步', { timeOut: 5000 });
                     }
                 } else if (syncResult.mode === 'update') {
                     console.log('✅ [世界书同步-覆盖] 热更新完成，无需等待UI刷新');
                 }
 
                 // ⚡ 自动化流：触发自动向量化
+                if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) return;
                 if (window.Gaigai.config_obj.autoVectorizeSummary) {
                     if (window.Gaigai.VM && typeof window.Gaigai.VM.syncSummaryToBook === 'function') {
                         console.log('⚡ [自动化流] 世界书同步完成，正在触发自动向量化...');

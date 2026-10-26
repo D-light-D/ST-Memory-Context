@@ -367,7 +367,8 @@
                 const activeBooks = ctx.chatMetadata?.gaigai_activeBooks || [];
 
                 // ✅ 修复：使用 Set 强制去重，防止同一本书被处理多次
-                return [...new Set(Array.isArray(activeBooks) ? activeBooks : [])];
+                return [...new Set(Array.isArray(activeBooks) ? activeBooks : [])]
+                    .filter(id => !id.startsWith('summary_book_') || id === `summary_book_${m.gid()}`);
             } catch (error) {
                 console.error('❌ [VectorManager] 获取 activeBooks 失败:', error);
                 return [];
@@ -1130,11 +1131,17 @@
                     if (chunkText.trim()) newChunks.push(chunkText.trim());
                 }
 
-                if (newChunks.length === 0) throw new Error('总结表内容为空');
-
                 // 2. 准备 ID 和 旧数据
                 const sessionId = m.gid() || 'default';
                 const bookId = 'summary_book_' + sessionId;
+                if (newChunks.length === 0) {
+                    if (this.library[bookId]) {
+                        delete this.library[bookId];
+                        this.saveLibrary();
+                    }
+                    this.setActiveBooks(this.getActiveBooks().filter(id => id !== bookId));
+                    return { success: true, count: 0 };
+                }
                 const defaultBookName = '《剧情总结归档》';
 
                 let existingVectorsMap = new Map(); // Map<Text, Vector>

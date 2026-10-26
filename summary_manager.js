@@ -292,348 +292,70 @@
         return ranges.map(range => `/hide ${range}`);
     }
 
-    // ✅ 新版本：无感隐藏函数（直接修改数据+DOM，无界面跳动）
-    async function silentHideMessages(messageIndices, logPrefix = '隐藏') {
-        if (messageIndices.length === 0) return;
-
-        console.log(`📝 [${logPrefix}] 准备无感隐藏 ${messageIndices.length} 条消息`);
-
-        const ctx = window.SillyTavern.getContext();
-        if (!ctx || !ctx.chat) {
-            console.warn(`❌ [${logPrefix}] 无法获取聊天上下文`);
-            return;
-        }
-
-        let successCount = 0;
-
-        for (const index of messageIndices) {
-            // 1. 修改数据
-            if (ctx.chat[index]) {
-                ctx.chat[index].is_system = true;
-
-                // 2. 更新DOM（如果消息在界面上）
-                const $mesDiv = $(`#chat .mes[mesid="${index}"]`);
-                if ($mesDiv.length > 0) {
-                    // 关键：修改DOM的is_system属性，CSS会自动显示幽灵图标
-                    $mesDiv.attr('is_system', 'true');
-
-                    console.log(`  ✓ [${logPrefix}] 已隐藏索引 ${index}`);
-                    successCount++;
-                } else {
-                    console.log(`  ⚠️ [${logPrefix}] 索引 ${index} 的DOM未找到（可能在屏幕外）`);
-                    successCount++; // 数据已修改，算成功
-                }
-            }
-        }
-
-        // 3. 保存到硬盘
-        try {
-            await ctx.saveChat();
-            console.log(`💾 [${logPrefix}] 已保存 ${successCount}/${messageIndices.length} 条隐藏记录`);
-        } catch (e) {
-            console.error(`❌ [${logPrefix}] 保存失败:`, e);
-        }
-
-        console.log(`✅ [${logPrefix}] 无感隐藏完成（无界面跳动）`);
-    }
-
-    // ✅ Native Hiding: 已总结隐藏（智能触发版）
-    async function applyNativeHiding() {
-        // 1. Check Config
+    // Visibility is derived from the current timeline, not an irreversible /hide history.
+    // Mark only hides owned by this extension, so manually hidden messages stay hidden.
+    function reconcileMessageVisibility() {
         const C = window.Gaigai.config_obj;
-        // 🔴 全局主开关守卫
-        if (!C.masterSwitch) return;
-        if (!C.autoSummaryHideContext) return;
-
-        const m = window.Gaigai.m;
-        const ctx = m.ctx();
-        if (!ctx || !ctx.chat || ctx.chat.length === 0) return;
-
-        const summaryPointer = window.Gaigai.config.lastSummaryIndex || 0;
-        if (summaryPointer <= 0) return;
-
-        // 2. 读取延迟配置（跟随自动总结的延迟设置）
-        const delayFloors = C.autoSummaryDelay ? (parseInt(C.autoSummaryDelayCount) || 0) : 0;
-
-        // 3. 计算当前楼层数（只计算对话消息）
-        let currentFloor = 0;
-        for (let i = 0; i < ctx.chat.length; i++) {
-            const msg = ctx.chat[i];
-            if (msg.role === 'system' || msg.isGaigaiPrompt || msg.isGaigaiData) continue;
-            currentFloor++;
+        const ctx = window.Gaigai.m.ctx();
+        if (!ctx?.chat) return false;
+        const dialogue = ctx.chat.map((msg, i) => ({ msg, i }))
+            .filter(({ msg }) => msg.role !== 'system' && !msg.isGaigaiPrompt && !msg.isGaigaiData);
+        const keep = Math.max(1, parseInt(C.contextLimitCount) || 30);
+        const cutoff = C.masterSwitch && C.contextLimit ? Math.max(0, dialogue.length - keep) : 0;
+        const pointer = window.Gaigai.config.lastSummaryIndex || 0;
+        const delay = C.autoSummaryDelay ? (parseInt(C.autoSummaryDelayCount) || 0) : 0;
+        const summaryEnd = C.masterSwitch && C.autoSummaryHideContext && dialogue.length >= pointer + delay ? pointer : 0;
+        let changed = false;
+        for (let position = 0; position < dialogue.length; position++) {
+            const { msg, i } = dialogue[position];
+            const shouldHide = i !== 0 && (position < cutoff || i < summaryEnd);
+            let marker = msg.extra?.gaigai_visibility;
+            if (shouldHide && !marker) {
+                msg.extra = msg.extra || {};
+                marker = msg.extra.gaigai_visibility = { originalSystem: !!msg.is_system, hidden: false };
+                changed = true;
+            }
+            if (!marker) continue;
+            // Preserve a manual hide made after our previous update.
+            if (!marker.hidden && msg.is_system) marker.originalSystem = true;
+            const target = !!marker.originalSystem || shouldHide;
+            if (!!msg.is_system !== target) {
+                msg.is_system = target;
+                $(`#chat .mes[mesid="${i}"]`).attr('is_system', String(target));
+                changed = true;
+            }
+            if (marker.hidden !== shouldHide) changed = true;
+            marker.hidden = shouldHide;
         }
-
-        console.log(`🔍 [已总结隐藏] 总结指针: ${summaryPointer}, 当前楼层: ${currentFloor}, 延迟: ${delayFloors}层`);
-
-        // 4. 检查是否需要触发隐藏（当前楼层必须 >= 总结指针 + 延迟楼层）
-        if (currentFloor < summaryPointer + delayFloors) {
-            console.log(`⏸️ [已总结隐藏] 当前楼层 ${currentFloor} < 总结指针+延迟 (${summaryPointer + delayFloors})，暂不触发`);
-            return;
-        }
-
-        // 5. 应该隐藏的范围：0 到 summaryPointer-1
-        const rangeEnd = summaryPointer - 1;
-        if (rangeEnd < 0) return; // 无需隐藏
-
-        // 6. 获取已隐藏的楼层
-        const alreadyHidden = getHiddenMessageIndices();
-
-        // 7. 找到"上次隐藏边界"（在目标范围内，从后往前找到索引最大的已隐藏楼层）
-        let lastHiddenBoundary = -1;
-        for (let i = rangeEnd; i >= 0; i--) {
-            if (alreadyHidden.has(i)) {
-                lastHiddenBoundary = i;
-                break;
-            }
-        }
-
-        console.log(`🔍 [已总结隐藏] 应该隐藏到: ${rangeEnd}, 上次连续隐藏边界: ${lastHiddenBoundary}`);
-
-        // 8. 分离旧区间和新区间
-        const shouldHide = [];
-
-        if (lastHiddenBoundary >= 0) {
-            // 有旧区间，检查旧区间是否已经50%隐藏
-            const oldRangeEnd = lastHiddenBoundary;
-            const oldRangeSize = oldRangeEnd + 1;
-            let oldRangeHiddenCount = 0;
-
-            for (let i = 0; i <= oldRangeEnd; i++) {
-                if (alreadyHidden.has(i)) {
-                    oldRangeHiddenCount++;
-                }
-            }
-
-            const oldRangeRatio = oldRangeHiddenCount / oldRangeSize;
-            const oldThreshold = 0.5; // 50% 阈值
-
-            console.log(`📊 [已总结隐藏-旧区间] 0-${oldRangeEnd} (共${oldRangeSize}条): 已隐藏 ${oldRangeHiddenCount} 条 (${(oldRangeRatio * 100).toFixed(1)}%)`);
-
-            if (oldRangeRatio < oldThreshold) {
-                // 旧区间未达标，需要补隐藏
-                console.log(`⚠️ [已总结隐藏-旧区间] 未达到50%，需要补充隐藏`);
-                for (let i = 0; i <= oldRangeEnd; i++) {
-                    if (!alreadyHidden.has(i)) {
-                        shouldHide.push(i);
-                    }
-                }
-            } else {
-                console.log(`✅ [已总结隐藏-旧区间] 已达到50%，跳过旧区间`);
-            }
-
-            // 新区间：上次边界+1 到 rangeEnd
-            const newRangeStart = lastHiddenBoundary + 1;
-            if (newRangeStart <= rangeEnd) {
-                const newRangeSize = rangeEnd - newRangeStart + 1;
-                console.log(`🆕 [已总结隐藏-新区间] ${newRangeStart}-${rangeEnd} (共${newRangeSize}条) 需要隐藏`);
-                for (let i = newRangeStart; i <= rangeEnd; i++) {
-                    if (!alreadyHidden.has(i)) {
-                        shouldHide.push(i);
-                    }
-                }
-            }
-        } else {
-            // 没有连续隐藏边界（可能是首次隐藏，或用户手动显示了开头的楼层）
-            // 检查整个范围的隐藏情况
-            const totalSize = rangeEnd + 1;
-            let totalHiddenCount = 0;
-
-            for (let i = 0; i <= rangeEnd; i++) {
-                if (alreadyHidden.has(i)) {
-                    totalHiddenCount++;
-                }
-            }
-
-            const totalRatio = totalHiddenCount / totalSize;
-            const threshold = 0.5; // 50% 阈值
-
-            console.log(`📊 [已总结隐藏-全范围] 0-${rangeEnd} (共${totalSize}条): 已隐藏 ${totalHiddenCount} 条 (${(totalRatio * 100).toFixed(1)}%)`);
-
-            if (totalRatio >= threshold) {
-                // 已经隐藏了一半以上，跳过（尊重用户手动操作）
-                console.log(`✅ [已总结隐藏] 已达到50%，跳过隐藏（尊重用户手动操作）`);
-                return;
-            } else {
-                // 未达到50%，需要隐藏
-                console.log(`🆕 [已总结隐藏] 未达到50%，执行隐藏 0-${rangeEnd}`);
-                for (let i = 0; i <= rangeEnd; i++) {
-                    if (!alreadyHidden.has(i)) {
-                        shouldHide.push(i);
-                    }
-                }
-            }
-        }
-
-        if (shouldHide.length === 0) {
-            console.log(`✅ [已总结隐藏] 范围内所有楼层都已隐藏，无需操作`);
-            return;
-        }
-
-        console.log(`🎯 [已总结隐藏] 需要隐藏 ${shouldHide.length} 个楼层`);
-
-        // 8. 执行无感隐藏
-        await silentHideMessages(shouldHide, '已总结隐藏');
+        return changed;
     }
 
-    // ✅ 暴露为全局函数，供监控系统调用
+    async function applyVisibility() {
+        const ctx = window.Gaigai.m.ctx();
+        if (reconcileMessageVisibility()) await ctx?.saveChat?.();
+    }
+    const applyNativeHiding = applyVisibility;
+    const applyContextLimitHiding = applyVisibility;
+    window.Gaigai.reconcileMessageVisibility = reconcileMessageVisibility;
     window.Gaigai.applyNativeHiding = applyNativeHiding;
-
-    // ✅ Context Limit Hiding: 留N层隐藏（修复索引映射版）
-    async function applyContextLimitHiding() {
-        // ⚠️ 已移除配置同步 - 发送前不需要同步，直接读取内存中的配置
-        const C = window.Gaigai.config_obj;
-        // 🔴 全局主开关守卫
-        if (!C.masterSwitch) return;
-        const m = window.Gaigai.m;
-
-        // 1. 检查是否启用上下文限制
-        if (!C.contextLimit) return;
-
-        const keepFloors = parseInt(C.contextLimitCount) || 30;
-
-        console.log(`🔧 [配置读取] 留${keepFloors}层`);
-
-        // 2. 获取当前聊天记录
-        const ctx = m.ctx();
-        if (!ctx || !ctx.chat || ctx.chat.length === 0) return;
-
-        // 3. 🔥 修复：建立对话楼层到原始索引的映射
-        const dialogueIndexMap = []; // 存储每条对话消息对应的原始索引
-        let dialogueCount = 0;
-
-        for (let i = 0; i < ctx.chat.length; i++) {
-            const msg = ctx.chat[i];
-            // 跳过 system 消息
-            if (msg.role === 'system' || msg.isGaigaiPrompt || msg.isGaigaiData) continue;
-
-            dialogueIndexMap.push(i); // 记录第N条对话消息对应的原始索引
-            dialogueCount++;
-        }
-
-        console.log(`🔍 [留N层隐藏] 当前对话楼层: ${dialogueCount}, 保留: ${keepFloors}`);
-
-        // 4. 如果当前楼层数不足保留数量，不执行
-        if (dialogueCount <= keepFloors) {
-            console.log(`⏸️ [留N层隐藏] 当前楼层 ${dialogueCount} <= 保留楼层 ${keepFloors}，无需隐藏`);
-            return;
-        }
-
-        // 5. 🔥 修复：计算需要隐藏到第几条对话消息
-        // 保留最后 keepFloors 条对话，所以要隐藏前 (dialogueCount - keepFloors) 条
-        const hideDialogueCount = dialogueCount - keepFloors;
-
-        if (hideDialogueCount <= 0) {
-            console.log(`⏸️ [留N层隐藏] 需要隐藏的对话数 <= 0，无需隐藏`);
-            return;
-        }
-
-        // 6. 🔥 修复：找到第 hideDialogueCount 条对话消息对应的原始索引
-        const hideRangeEnd = dialogueIndexMap[hideDialogueCount - 1];
-
-        console.log(`📊 [留N层隐藏] 需隐藏前 ${hideDialogueCount} 条对话 → 原始索引 0-${hideRangeEnd} (保留对话 ${hideDialogueCount + 1}-${dialogueCount})`);
-
-        // 7. 获取已隐藏的楼层
-        const alreadyHidden = getHiddenMessageIndices();
-
-        // 8. 找到"上次隐藏边界"（在目标范围内，从后往前找到索引最大的已隐藏楼层）
-        let lastHiddenBoundary = -1;
-        for (let i = hideRangeEnd; i >= 0; i--) {
-            if (alreadyHidden.has(i)) {
-                lastHiddenBoundary = i;
-                break;
-            }
-        }
-
-        console.log(`🔍 [留N层隐藏] 应该隐藏到: ${hideRangeEnd}, 上次连续隐藏边界: ${lastHiddenBoundary}`);
-
-        // 9. 分离旧区间和新区间
-        const shouldHide = [];
-
-        if (lastHiddenBoundary >= 0) {
-            // 有旧区间，检查旧区间是否已经90%隐藏
-            const oldRangeEnd = lastHiddenBoundary;
-            const oldRangeSize = oldRangeEnd + 1;
-            let oldRangeHiddenCount = 0;
-
-            for (let i = 0; i <= oldRangeEnd; i++) {
-                if (alreadyHidden.has(i)) {
-                    oldRangeHiddenCount++;
-                }
-            }
-
-            const oldRangeRatio = oldRangeHiddenCount / oldRangeSize;
-            const oldThreshold = 0.5; // 50% 阈值
-
-            console.log(`📊 [留N层隐藏-旧区间] 0-${oldRangeEnd} (共${oldRangeSize}条): 已隐藏 ${oldRangeHiddenCount} 条 (${(oldRangeRatio * 100).toFixed(1)}%)`);
-
-            if (oldRangeRatio < oldThreshold) {
-                // 旧区间未达标，需要补隐藏
-                console.log(`⚠️ [留N层隐藏-旧区间] 未达到50%，需要补充隐藏`);
-                for (let i = 0; i <= oldRangeEnd; i++) {
-                    if (!alreadyHidden.has(i)) {
-                        shouldHide.push(i);
-                    }
-                }
-            } else {
-                console.log(`✅ [留N层隐藏-旧区间] 已达到50%，跳过旧区间`);
-            }
-
-            // 新区间：上次边界+1 到 hideRangeEnd
-            const newRangeStart = lastHiddenBoundary + 1;
-            if (newRangeStart <= hideRangeEnd) {
-                const newRangeSize = hideRangeEnd - newRangeStart + 1;
-                console.log(`🆕 [留N层隐藏-新区间] ${newRangeStart}-${hideRangeEnd} (共${newRangeSize}条) 需要隐藏`);
-                for (let i = newRangeStart; i <= hideRangeEnd; i++) {
-                    if (!alreadyHidden.has(i)) {
-                        shouldHide.push(i);
-                    }
-                }
-            }
-        } else {
-            // 没有连续隐藏边界（可能是首次隐藏，或用户手动显示了开头的楼层）
-            // 检查整个范围的隐藏情况
-            const totalSize = hideRangeEnd + 1;
-            let totalHiddenCount = 0;
-
-            for (let i = 0; i <= hideRangeEnd; i++) {
-                if (alreadyHidden.has(i)) {
-                    totalHiddenCount++;
-                }
-            }
-
-            const totalRatio = totalHiddenCount / totalSize;
-            const threshold = 0.5; // 50% 阈值
-
-            console.log(`📊 [留N层隐藏-全范围] 0-${hideRangeEnd} (共${totalSize}条): 已隐藏 ${totalHiddenCount} 条 (${(totalRatio * 100).toFixed(1)}%)`);
-
-            if (totalRatio >= threshold) {
-                // 已经隐藏了一半以上，跳过（尊重用户手动操作）
-                console.log(`✅ [留N层隐藏] 已达到50%，跳过隐藏（尊重用户手动操作）`);
-                return;
-            } else {
-                // 未达到50%，需要隐藏
-                console.log(`🆕 [留N层隐藏] 未达到50%，执行隐藏 0-${hideRangeEnd}`);
-                for (let i = 0; i <= hideRangeEnd; i++) {
-                    if (!alreadyHidden.has(i)) {
-                        shouldHide.push(i);
-                    }
-                }
-            }
-        }
-
-        if (shouldHide.length === 0) {
-            console.log(`✅ [留N层隐藏] 所有需要隐藏的楼层都已隐藏，无需操作`);
-            return;
-        }
-
-        console.log(`🎯 [留N层隐藏] 本次需要隐藏 ${shouldHide.length} 条消息`);
-
-        // 10. 执行无感隐藏
-        await silentHideMessages(shouldHide, '留N层隐藏');
-    }
-
-    // ✅ 暴露为全局函数
     window.Gaigai.applyContextLimitHiding = applyContextLimitHiding;
+
+    function commitSummaryResult(text, note, end, sourceIndices = [], hideData = false, big = false, clearIndices = []) {
+        const app = window.Gaigai, m = app.m;
+        return app.commitMemoryOperation(end, () => {
+            const summary = m.s[m.s.length - 1];
+            if (clearIndices.length) summary.delMultiple(clearIndices);
+            m.sm.save(text, note);
+            app.config.lastSummaryIndex = Math.max(app.config.lastSummaryIndex || 0, end);
+            if (big) app.config.lastBigSummaryIndex = Math.max(app.config.lastBigSummaryIndex || 0, end);
+            if (app.config_obj.autoVectorizeSummary) {
+                summary.r.forEach((_, ri) => app.markAsSummarized(m.s.length - 1, ri));
+            }
+            if (hideData) sourceIndices.forEach(ti => {
+                m.s[ti]?.r.forEach((_, ri) => app.markAsSummarized(ti, ri));
+            });
+        }, { type: big ? 'big-summary' : 'summary', end, range: note });
+    }
 
     class SummaryManager {
         constructor() {
@@ -1284,9 +1006,11 @@
          * @param {boolean} useRawRange - 聊天模式下是否把 forceStart/forceEnd 按原始消息索引解释（自动流程用）
          */
         async callAIForSummary(forceStart = null, forceEnd = null, forcedMode = null, isSilent = false, isBatch = false, skipSave = false, targetTableIndices = null, skipWorldInfoSync = false, useRawRange = false) {
+            const requestedChat = window.Gaigai.captureHistoryToken();
             // 使用 window.Gaigai.loadConfig 确保配置最新
             const loadConfig = window.Gaigai.loadConfig || (() => Promise.resolve());
             await loadConfig();
+            if (!window.Gaigai.isHistoryTokenCurrent(requestedChat)) return { success: false, error: 'history_changed' };
 
             const API_CONFIG = window.Gaigai.config;
             const C = window.Gaigai.config_obj;
@@ -1294,6 +1018,7 @@
 
             // 🛡️ [Safe Guard] Capture session ID at start to prevent data bleeding
             const initialSessionId = m.gid();
+            const historyToken = window.Gaigai.captureHistoryToken();
 
             const currentMode = forcedMode || API_CONFIG.summarySource;
             const isTableMode = currentMode !== 'chat';
@@ -1307,6 +1032,7 @@
                 if (!tableContentRaw) {
                     if (!isSilent) {
                         if (await window.Gaigai.customConfirm('⚠️ 当前表格没有【未总结】的新内容。\n（所有行可能都已标记为绿色/已归档）\n\n是否转为"总结聊天历史"？', '无新内容')) {
+                            if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) return { success: false, error: 'history_changed' };
                             return this.callAIForSummary(forceStart, forceEnd, 'chat', isSilent, isBatch, skipSave, targetTableIndices, skipWorldInfoSync, useRawRange);
                         }
                     } else {
@@ -1317,7 +1043,8 @@
             }
 
             // 动态获取所有数据表（不包含总结表）
-            const tables = m.all().slice(0, -1).filter(s => s.r.length > 0);
+            const referenceEnd = forceEnd === null ? m.ctx().chat.length : Math.min(parseInt(forceEnd), m.ctx().chat.length);
+            const tables = window.Gaigai.memoryTablesAt(referenceEnd).slice(0, -1).filter(s => s.r.length > 0);
             const ctx = window.SillyTavern.getContext();
 
             // 🛑 新增：空卡熔断保护
@@ -1346,7 +1073,7 @@
             if (isTableMode && targetTableIndices && Array.isArray(targetTableIndices) && targetTableIndices.length > 0) {
                 filteredTables = tables.filter((table, idx) => {
                     // 找到该表格在 m.s 中的实际索引
-                    const actualIndex = m.s.indexOf(table);
+                    const actualIndex = table.historyTableIndex;
                     return targetTableIndices.includes(actualIndex);
                 });
                 console.log(`📊 [表格过滤] 用户选择了 ${targetTableIndices.length} 个表格，过滤后实际有数据的表格: ${filteredTables.length} 个`);
@@ -1542,7 +1269,7 @@
                     if (sheet.r.length > 0) {
                         hasTableData = true;
                         // 找到该表格在 m.s 中的实际索引
-                        const actualIndex = m.s.indexOf(sheet);
+                        const actualIndex = sheet.historyTableIndex;
                         
                         // ✨✨✨ 修复：加上 name 和 isGaigaiData，让探针显示表名
                         messages.push({
@@ -1608,6 +1335,7 @@
 
                 const shouldRetry = await customRetryAlert(e.message, '⚠️ 请求错误');
                 if (shouldRetry) {
+                    if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) return { success: false, error: 'history_changed' };
                     return this.callAIForSummary(forceStart, forceEnd, forcedMode, isSilent, isBatch, skipSave, targetTableIndices, skipWorldInfoSync, useRawRange);
                 } else {
                     return { success: false, error: e.message };
@@ -1615,7 +1343,7 @@
             }
 
             // 🛡️ [Safe Guard] Check if session changed during API call
-            if (m.gid() !== initialSessionId) {
+            if (m.gid() !== initialSessionId || !window.Gaigai.isHistoryTokenCurrent(historyToken)) {
                 window.isSummarizing = false; // ✅ Session变化,解锁
                 console.warn(`🛑 [Safe Guard] Session changed during summary. Aborting.`);
                 return { success: false, error: 'session_changed' };
@@ -1635,6 +1363,7 @@
                         window.isSummarizing = false; // ✅ 弹窗前先解锁,避免阻塞
                         const shouldRetry = await window.Gaigai.customRetryAlert("总结内容过短或为空，AI 可能没看懂指令。", "⚠️ 内容无效");
                         if (shouldRetry) {
+                            if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) return { success: false, error: 'history_changed' };
                             return this.callAIForSummary(forceStart, forceEnd, forcedMode, isSilent, isBatch, skipSave, targetTableIndices, skipWorldInfoSync, useRawRange);
                         }
                     } else {
@@ -1643,98 +1372,15 @@
                     return { success: false, error: '总结内容过短或无效' };
                 }
 
-                // ✅✅✅ [核心修复] 无论是表格模式还是聊天模式，只要是自动(静默)执行，就必须推进指针，防止重复触发
-                if (isSilent && !skipSave && endIndex !== null && endIndex !== undefined) {
-                    const currentLast = API_CONFIG.lastSummaryIndex || 0;
-                    // 只有当新位置比旧位置靠后时才更新
-                    // ✅ 使用原始索引，而不是对话数量，避免 System 消息导致的索引错位
-                    if (endIndex > currentLast) {
-                        API_CONFIG.lastSummaryIndex = endIndex;
-                        localStorage.setItem('gg_api', JSON.stringify(API_CONFIG));
-                        console.log(`✅ [自动进度更新] 指针已推进至: 原始索引 ${endIndex} (模式: ${isTableMode ? '表格' : '聊天'})`);
-
-                        // ✅ 同步到云端，防止被全局配置覆盖
-                        if (typeof window.Gaigai.saveAllSettingsToCloud === 'function') {
-                            window.Gaigai.saveAllSettingsToCloud().catch(err => {
-                                console.warn('⚠️ [指针同步] 云端同步失败:', err);
-                            });
-                        }
-
-                        // ✅ 触发原生隐藏命令（总结后自动隐藏已总结楼层）
-                        await applyNativeHiding();
-                    }
-                }
-
                 if (isSilent && !skipSave) {
-                    // 总是先保存总结内容
-                    m.sm.save(cleanSummary, currentRangeStr);
-
-                    // ✅ 只有当 !skipWorldInfoSync 为真时，才执行世界书同步
-                    if (!skipWorldInfoSync) {
-                        await window.Gaigai.syncToWorldInfo(cleanSummary);
-                    }
-
-                    // ✅✅✅ [新增] 自动向量化开启时,自动隐藏总结表所有行
-                    if (window.Gaigai.config_obj.autoVectorizeSummary) {
-                        const sumIdx = m.s.length - 1; // 总结表索引
-                        const sumSheet = m.get(sumIdx);
-                        if (sumSheet && sumSheet.r.length > 0) {
-                            // 遍历所有行进行隐藏标记(覆盖旧数据)
-                            for (let ri = 0; ri < sumSheet.r.length; ri++) {
-                                window.Gaigai.markAsSummarized(sumIdx, ri);
-                            }
-                            console.log('⚡ [自动向量化] 已自动隐藏总结表所有行');
-                        }
-                    }
-
-                    // ✨✨✨ 修复：只要 isSilent 为 true，就直接执行静默保存，不再检查全局配置
-                    if (isTableMode && currentMode === 'table') {
-                        // 用户勾选了静默保存，自动标记为绿色并结束
-                        // 🔧 修复：只标记参与总结的表格（filteredTables），而不是所有表格（tables）
-                        filteredTables.forEach(table => {
-                            const ti = m.all().indexOf(table);
-                            if (ti !== -1) {
-                                for (let ri = 0; ri < table.r.length; ri++) window.Gaigai.markAsSummarized(ti, ri);
-                            }
-                        });
-
-                        if (typeof window.Gaigai.saveAllSettingsToCloud === 'function') {
-                            window.Gaigai.saveAllSettingsToCloud().catch(err => {
-                                console.warn('⚠️ [自动总结] 云端同步失败:', err);
-                            });
-                        }
-
-                        m.save(false, true); // 批量总结完成后立即保存
-                        if (typeof window.Gaigai.updateCurrentSnapshot === 'function') {
-                            window.Gaigai.updateCurrentSnapshot();
-                        }
-
-                        if ($('#gai-main-pop').length > 0) window.Gaigai.shw();
-
-                        if (typeof toastr !== 'undefined') {
-                            if (!isBatch) toastr.success('自动总结已在后台完成并保存', '记忆表格', { timeOut: 1000, preventDuplicates: true });
-                        }
-                        window.isSummarizing = false; // ✅ 静默模式保存完成,解锁
-                        return { success: true, summary: cleanSummary };
-                    } else {
-                        // 非表格模式(聊天总结),正常静默执行
-                        if (typeof window.Gaigai.saveAllSettingsToCloud === 'function') {
-                            window.Gaigai.saveAllSettingsToCloud().catch(err => {
-                                console.warn('⚠️ [自动总结] 云端同步失败:', err);
-                            });
-                        }
-
-                        m.save(false, true); // 自动总结完成后立即保存
-                        window.Gaigai.updateCurrentSnapshot();
-
-                        if ($('#gai-main-pop').length > 0) window.Gaigai.shw();
-
-                        if (typeof toastr !== 'undefined') {
-                            if (!isBatch) toastr.success('自动总结已在后台完成并保存', '记忆表格', { timeOut: 1000, preventDuplicates: true });
-                        }
-                        window.isSummarizing = false; // ✅ 静默模式保存完成,解锁
-                        return { success: true, summary: cleanSummary };
-                    }
+                    commitSummaryResult(cleanSummary, currentRangeStr, endIndex,
+                        filteredTables.map(table => table.historyTableIndex), isTableMode && currentMode === 'table');
+                    await applyNativeHiding();
+                    if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) return { success: false, error: 'history_changed' };
+                    if (!skipWorldInfoSync) await window.Gaigai.syncToWorldInfo(null, true);
+                    if ($('#gai-main-pop').length > 0) window.Gaigai.shw();
+                    window.isSummarizing = false;
+                    return { success: true, summary: cleanSummary };
                 } else if (isSilent && skipSave) {
                     window.isSummarizing = false; // ✅ 静默且跳过保存,解锁
                     return { success: true, summary: cleanSummary };
@@ -1776,6 +1422,7 @@
 
                 if (shouldRetry) {
                     // 用户点击"重试"，递归调用
+                    if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) return { success: false, error: 'history_changed' };
                     return this.callAIForSummary(forceStart, forceEnd, forcedMode, isSilent, isBatch, skipSave, targetTableIndices, skipWorldInfoSync, useRawRange);
                 } else {
                     // 用户点击"放弃"，停止递归
@@ -1795,6 +1442,7 @@
 
             // 🔒 关键修复：记录弹窗打开时的会话ID
             const initialSessionId = m.gid();
+            const historyToken = window.Gaigai.captureHistoryToken();
             if (!initialSessionId) {
                 window.Gaigai.customAlert('🛑 安全拦截：无法获取会话标识', '错误');
                 return Promise.resolve({ success: false });
@@ -1943,7 +1591,7 @@
                             return;
                         }
 
-                        if (currentSessionId !== initialSessionId) {
+                        if (currentSessionId !== initialSessionId || !window.Gaigai.isHistoryTokenCurrent(historyToken)) {
                             console.error(`🛑 [安全拦截] 会话ID不一致！弹窗打开: ${initialSessionId}, 保存时: ${currentSessionId}`);
                             await window.Gaigai.customAlert('🛑 安全拦截：检测到会话切换，已取消操作\n\n请重新打开总结功能', '错误');
                             return;
@@ -1951,57 +1599,15 @@
 
                         console.log(`🔒 [安全验证通过] 会话ID: ${currentSessionId}, 准备保存总结`);
 
-                        m.sm.save(editedSummary, noteValue);
-                        await window.Gaigai.syncToWorldInfo(editedSummary);
-
-                        // ✅✅✅ [新增] 自动向量化开启时,自动隐藏总结表所有行
-                        if (window.Gaigai.config_obj.autoVectorizeSummary) {
-                            const sumIdx = m.s.length - 1; // 总结表索引
-                            const sumSheet = m.get(sumIdx);
-                            if (sumSheet && sumSheet.r.length > 0) {
-                                // 遍历所有行进行隐藏标记(覆盖旧数据)
-                                for (let ri = 0; ri < sumSheet.r.length; ri++) {
-                                    window.Gaigai.markAsSummarized(sumIdx, ri);
-                                }
-                                console.log('⚡ [自动向量化] 已自动隐藏总结表所有行');
-                            }
+                        const end = newIndex ?? m.ctx().chat.length;
+                        commitSummaryResult(editedSummary, noteValue, end);
+                        await applyNativeHiding();
+                        if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) {
+                            cleanup(); resolve({ success: false }); return;
                         }
-
-                        // ✅✅✅ [修复] 删除 !isTableMode 限制，无论什么模式都应更新进度指针
-                        if (newIndex !== null && newIndex !== undefined) {
-                            const currentLast = API_CONFIG.lastSummaryIndex || 0;
-                            // ✅ 使用原始索引，而不是对话数量，避免 System 消息导致的索引错位
-                            if (newIndex > currentLast) {
-                                API_CONFIG.lastSummaryIndex = newIndex;
-                                try { localStorage.setItem('gg_api', JSON.stringify(API_CONFIG)); } catch (e) { }
-                                console.log(`✅ [进度更新] 总结进度已更新至: 原始索引 ${newIndex} (模式: ${isTableMode ? '表格' : '聊天'})`);
-
-                                // ✨✨✨ [修复] 手动保存后，立即触发隐藏逻辑
-                                await applyNativeHiding();
-                            }
-                        }
-
-                        if (typeof window.Gaigai.saveAllSettingsToCloud === 'function') {
-                            window.Gaigai.saveAllSettingsToCloud().catch(err => {
-                                console.warn('⚠️ [总结保存] 云端同步失败:', err);
-                            });
-                        }
-
-                        // 🔒 安全检查2：保存前再次验证会话ID（防止同步期间切换会话）
-                        const saveSessionId = m.gid();
-                        if (saveSessionId !== initialSessionId) {
-                            console.error(`🛑 [安全拦截] 会话ID不一致！弹窗打开: ${initialSessionId}, 最终保存时: ${saveSessionId}`);
-                            await window.Gaigai.customAlert('🛑 安全拦截：检测到会话切换，数据未保存\n\n警告：总结可能已同步到世界书，请检查数据完整性！', '严重错误');
-                            cleanup();
-                            resolve({ success: false });
-                            return;
-                        }
-
-                        console.log(`🔒 [最终验证通过] 会话ID: ${saveSessionId}, 保存总结数据`);
-
-                        m.save(false, true); // 总结保存后立即同步
-                        if (typeof window.Gaigai.updateCurrentSnapshot === 'function') {
-                            window.Gaigai.updateCurrentSnapshot();
+                        await window.Gaigai.syncToWorldInfo(null, true);
+                        if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) {
+                            cleanup(); resolve({ success: false }); return;
                         }
 
                         cleanup(); // ✅ 关闭弹窗并释放锁
@@ -2092,6 +1698,7 @@
                                     border: `1px solid ${isDark ? '#ff6b6b' : '#dc3545'}`
                                 }
                             }).on('click', () => {
+                                if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) return;
                                 // 🔧 修复：只清空参与总结的表格（sourceTables），而不是所有数据表
                                 console.log(`🗑️ [批量清空] 正在清空 ${sourceTables.length} 个参与总结的数据表...`);
 
@@ -2103,11 +1710,9 @@
                                     window.Gaigai.saveSnapshot('backup_pre_summary_clear_' + Date.now());
                                 }
 
-                                sourceTables.forEach(table => {
-                                    if (table) {
-                                        table.clear();
-                                    }
-                                });
+                                window.Gaigai.commitMemoryOperation(newIndex ?? m.ctx().chat.length, () => {
+                                    sourceTables.forEach(table => m.s[table.historyTableIndex ?? m.s.indexOf(table)]?.clear());
+                                }, { type: 'summary-clear', end: newIndex });
 
                                 finish('✅ 已总结的数据表已清空，总结已归档（操作前已自动备份，可在"恢复数据"中找回）。');
                             });
@@ -2125,18 +1730,13 @@
                                 // 🔧 修复：只标记参与总结的表格（sourceTables），而不是所有数据表
                                 console.log(`🙈 [批量隐藏] 正在处理 ${sourceTables.length} 个参与总结的数据表...`);
 
-                                sourceTables.forEach(table => {
-                                    if (table && table.r && table.r.length > 0) {
-                                        // 获取该表在 m.s 中的真实索引
-                                        const tableIndex = m.s.indexOf(table);
-                                        if (tableIndex !== -1) {
-                                            // 将该表所有行标记为已总结
-                                            for (let ri = 0; ri < table.r.length; ri++) {
-                                                window.Gaigai.markAsSummarized(tableIndex, ri);
-                                            }
-                                        }
-                                    }
-                                });
+                                if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) return;
+                                window.Gaigai.commitMemoryOperation(newIndex ?? m.ctx().chat.length, () => {
+                                    sourceTables.forEach(table => {
+                                        const ti = table.historyTableIndex ?? m.s.indexOf(table);
+                                        m.s[ti]?.r.forEach((_, ri) => window.Gaigai.markAsSummarized(ti, ri));
+                                    });
+                                }, { type: 'summary-hide', end: newIndex });
 
                                 finish('✅ 已总结的数据表已标记为已总结（绿色）。');
                             });
@@ -2155,6 +1755,7 @@
                             });
 
                             function finish(msg) {
+                                if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) { $dOverlay.remove(); resolve({ success: false }); return; }
                                 m.save(false, true); // 总结去重操作立即保存
                                 $dOverlay.remove();
                                 if ($('#gai-main-pop').length > 0) window.Gaigai.shw();
@@ -2192,6 +1793,7 @@
             const m = window.Gaigai.m;
             const API_CONFIG = window.Gaigai.config;
             const C = window.Gaigai.config_obj;
+            const historyToken = window.Gaigai.captureHistoryToken();
             const wasBigSummaryRunning = !!window.Gaigai.isBigSummaryRunning;
             window.Gaigai.isBigSummaryRunning = true;
             window.Gaigai.pendingBigSummaryEnd = Math.max(window.Gaigai.pendingBigSummaryEnd || 0, end);
@@ -2221,7 +1823,8 @@
                         // ✅ 防重复触发：既然该区间总结已存在，直接推进大总结指针到区间末尾
                         const currentBigIndex = API_CONFIG.lastBigSummaryIndex || 0;
                         if (end > currentBigIndex) {
-                            API_CONFIG.lastBigSummaryIndex = end;
+                            window.Gaigai.commitMemoryOperation(end, () => { API_CONFIG.lastBigSummaryIndex = end; },
+                                { type: 'big-summary-progress', start, end });
                             localStorage.setItem('gg_api', JSON.stringify(API_CONFIG));
                             m.save(false, true);
                             if (typeof window.Gaigai.saveAllSettingsToCloud === 'function') {
@@ -2245,6 +1848,7 @@
 
                 // 🛡️ 防撞车锁：如果常规小总结正在执行，大总结必须排队等待其落盘
                 while (window.isSummarizing) {
+                    if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) return;
                     console.log('⏳ [大总结] 检测到小总结正在生成，大总结排队等待 2 秒...');
                     await new Promise(resolve => setTimeout(resolve, 2000));
                 }
@@ -2261,9 +1865,12 @@
                 // callAIForSummary(skipSave=true) 会释放通用总结锁；大总结清理/写入阶段继续持锁。
                 window.isSummarizing = true;
 
+                if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) return;
+
                 // 2. 获取总结表
                 m.load();
-                const sumSheet = m.get(m.s.length - 1);
+                const historicalTables = window.Gaigai.memoryTablesAt(end);
+                const sumSheet = historicalTables[historicalTables.length - 1];
                 if (!sumSheet) {
                     console.error('❌ [大总结] 总结表不存在');
                     return;
@@ -2297,7 +1904,7 @@
                 }
 
                 if (indicesToDelete.length > 0) {
-                    sumSheet.delMultiple(indicesToDelete);
+                    // Removal is committed atomically with the replacement summary below.
                     console.log(`🗑️ [大总结] 已清理 ${indicesToDelete.length} 个零散总结`);
                 }
 
@@ -2311,16 +1918,9 @@
                 }
 
                 // 4. 写入大总结（删除后保存，标题会自动按顺序命名）
-                m.sm.save(result.summary, `${start}-${end}`);
-                console.log(`✅ [大总结] 已保存: ${start}-${end}`);
-
-                // 4. 更新进度指针
-                API_CONFIG.lastBigSummaryIndex = end;
-                if ((API_CONFIG.lastSummaryIndex || 0) < end) {
-                    API_CONFIG.lastSummaryIndex = end;
-                }
-                localStorage.setItem('gg_api', JSON.stringify(API_CONFIG));
-                m.save(true, true);
+                commitSummaryResult(result.summary, `${start}-${end}`, end, [], false, true, indicesToDelete);
+                await applyNativeHiding();
+                if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) return;
 
                 // 5. 同步到世界书
                 await window.Gaigai.WI.syncToWorldInfo(null, true);
@@ -2351,6 +1951,7 @@
          * 分批总结函数（迁移自 index.js）
          */
         async runBatchSummary(start, end, step, mode = 'chat', silent = false) {
+            const batchToken = window.Gaigai.captureHistoryToken();
             const self = this;
             const API_CONFIG = window.Gaigai.config;
             const totalRange = end - start;
@@ -2393,7 +1994,7 @@
             // 依次执行每一批
             for (let i = 0; i < batches.length; i++) {
                 // 🛑 循环内检测刹车
-                if (window.Gaigai.stopBatch) {
+                if (window.Gaigai.stopBatch || !window.Gaigai.isHistoryTokenCurrent(batchToken)) {
                     console.log('🛑 [分批总结] 用户手动停止');
                     if (!silent) await window.Gaigai.customAlert('✅ 任务已手动停止', '已中止');
                     break;
@@ -2402,13 +2003,13 @@
                 // ⏳ 冷却逻辑
                 if (i > 0) {
                     for (let d = 5; d > 0; d--) {
-                        if (window.Gaigai.stopBatch) break;
+                        if (window.Gaigai.stopBatch || !window.Gaigai.isHistoryTokenCurrent(batchToken)) break;
                         updateBtn(`⏳ 冷却 ${d}s... (点此停止)`, true);
                         await new Promise(r => setTimeout(r, 1000));
                     }
                 }
 
-                if (window.Gaigai.stopBatch) break;
+                if (window.Gaigai.stopBatch || !window.Gaigai.isHistoryTokenCurrent(batchToken)) break;
 
                 const batch = batches[i];
                 const batchNum = i + 1;
@@ -2441,7 +2042,7 @@
 
                 } catch (error) {
                     // ✨✨✨ 修复：如果用户已经点了停止，直接退出，不要弹窗问废话
-                    if (window.Gaigai.stopBatch) {
+                    if (window.Gaigai.stopBatch || !window.Gaigai.isHistoryTokenCurrent(batchToken)) {
                         console.warn(`🛑 [分批总结] 检测到用户停止，跳过异常弹窗`);
                         break; 
                     }
@@ -2467,13 +2068,13 @@
                 console.log(`⏳ [批次缓冲] 等待数据完全落盘 (6秒)...`);
                 // 🛑 分秒检查停止标志，确保及时响应
                 for (let delay = 6; delay > 0; delay--) {
-                    if (window.Gaigai.stopBatch) break;
+                    if (window.Gaigai.stopBatch || !window.Gaigai.isHistoryTokenCurrent(batchToken)) break;
                     await new Promise(r => setTimeout(r, 1000));
                 }
             }
 
             // ✅ [分批缓存优化] 循环结束后，一次性同步完整表格到世界书
-            if (successCount > 0 && !window.Gaigai.stopBatch) {
+            if (successCount > 0 && !window.Gaigai.stopBatch && window.Gaigai.isHistoryTokenCurrent(batchToken)) {
                 console.log("🚀 [分批总结] 批量任务完成，正在将完整表格镜像同步到世界书...");
                 try {
                     await window.Gaigai.syncToWorldInfo(null, true);
@@ -2484,7 +2085,7 @@
             }
 
             // 等待最后一批数据的世界书同步防抖结束
-            if (successCount > 0 && !window.Gaigai.stopBatch) {
+            if (successCount > 0 && !window.Gaigai.stopBatch && window.Gaigai.isHistoryTokenCurrent(batchToken)) {
                 console.log('⏳ [分批结束] 正在等待最后一次世界书同步完成 (11s = 5s防抖 + 5s缓冲 + 1s余量)...');
                 await new Promise(r => setTimeout(r, 11000));
             }
@@ -2499,6 +2100,7 @@
             // ❌ 已移除：不在内部恢复按钮，由外层调用者统一处理
             // updateBtn('🚀 开始聊天总结', false);
 
+            if (!window.Gaigai.isHistoryTokenCurrent(batchToken)) return;
             // 结果汇报
             if (successCount > 0) {
                 // ✅ 使用原始索引，而不是对话数量，避免 System 消息导致的索引错位
@@ -2558,6 +2160,7 @@
 
                 // 🛡️ [Safe Guard] Capture session ID at start to prevent data bleeding
                 const initialSessionId = m.gid();
+                const historyToken = window.Gaigai.captureHistoryToken();
 
                 // 读取总结表（动态获取最后一个表格）
                 const summaryTable = m.s[m.s.length - 1];
@@ -2607,11 +2210,11 @@
             if (batchMode && targetIndices.length > batchStep) {
                 // 🔄 分批执行模式
                 console.log(`📦 [分批优化] 启用分批模式，每批 ${batchStep} 页，共 ${targetIndices.length} 页`);
-                await this._optimizeSummaryBatch(targetIndices, userPrompt, batchStep, initialSessionId);
+                await this._optimizeSummaryBatch(targetIndices, userPrompt, batchStep, initialSessionId, historyToken);
             } else {
                 // 🚀 单次执行模式（原有逻辑）
                 console.log(`🚀 [单次优化] 一次性处理 ${targetIndices.length} 页`);
-                await this._optimizeSummarySingle(targetIndices, userPrompt, initialSessionId);
+                await this._optimizeSummarySingle(targetIndices, userPrompt, initialSessionId, historyToken);
             }
 
             } finally {
@@ -2632,7 +2235,7 @@
          * 🆕 单次优化执行（原有逻辑）
          * @private
          */
-        async _optimizeSummarySingle(targetIndices, userPrompt, initialSessionId) {
+        async _optimizeSummarySingle(targetIndices, userPrompt, initialSessionId, historyToken) {
             const m = window.Gaigai.m;
             const ctx = m.ctx();
             const summaryTable = m.s[m.s.length - 1];
@@ -2719,7 +2322,7 @@
             }
 
             // 🛡️ [Safe Guard] Check if session changed during API call
-            if (m.gid() !== initialSessionId) {
+            if (m.gid() !== initialSessionId || !window.Gaigai.isHistoryTokenCurrent(historyToken)) {
                 console.warn(`🛑 [Safe Guard] Session changed during summary optimization. Aborting.`);
                 return { success: false, error: 'session_changed' };
             }
@@ -2781,7 +2384,7 @@
          * 🆕 分批优化执行（重构版：增强的错误处理和停止逻辑）
          * @private
          */
-        async _optimizeSummaryBatch(targetIndices, userPrompt, batchStep, initialSessionId) {
+        async _optimizeSummaryBatch(targetIndices, userPrompt, batchStep, initialSessionId, historyToken) {
             const m = window.Gaigai.m;
             const summaryTable = m.s[m.s.length - 1];
 
@@ -2871,10 +2474,11 @@
                     let result = null;
 
                     while (retryCount <= 1) {
+                        if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) return;
                         try {
                             // 调用单次优化逻辑处理当前批次
                             if (fixedUserPrompt) console.log(`📝 [批次 ${batchNum}] 正在应用用户自定义指令...`);
-                            await this._optimizeSummarySingle(currentBatch, fixedUserPrompt, initialSessionId);
+                            await this._optimizeSummarySingle(currentBatch, fixedUserPrompt, initialSessionId, historyToken);
 
                             // 🛑 检查点 3：API返回后立即检查
                             if (window.Gaigai.stopOptimizationBatch) {
@@ -3053,6 +2657,7 @@
 
             // 🔒 关键修复：记录弹窗打开时的会话ID
             const initialSessionId = m.gid();
+            const historyToken = window.Gaigai.captureHistoryToken();
             if (!initialSessionId) {
                 window.Gaigai.customAlert('🛑 安全拦截：无法获取会话标识', '错误');
                 return Promise.resolve({ success: false });
@@ -3130,7 +2735,7 @@
                             return;
                         }
 
-                        if (currentSessionId !== initialSessionId) {
+                        if (currentSessionId !== initialSessionId || !window.Gaigai.isHistoryTokenCurrent(historyToken)) {
                             console.error(`🛑 [安全拦截] 会话ID不一致！弹窗打开: ${initialSessionId}, 执行时: ${currentSessionId}`);
                             await window.Gaigai.customAlert('🛑 安全拦截：检测到会话切换，已取消操作\n\n请重新打开总结优化功能', '错误');
                             return;
@@ -3147,7 +2752,7 @@
 
                         // 🔒 安全检查3：保存前再次验证会话ID
                         const finalSessionId = m.gid();
-                        if (finalSessionId !== initialSessionId) {
+                        if (finalSessionId !== initialSessionId || !window.Gaigai.isHistoryTokenCurrent(historyToken)) {
                             console.error(`🛑 [安全拦截] 会话ID不一致！弹窗打开: ${initialSessionId}, 保存前: ${finalSessionId}`);
                             await window.Gaigai.customAlert('🛑 安全拦截：检测到会话切换，已取消操作', '错误');
                             return;
@@ -3216,7 +2821,7 @@
                             return;
                         }
 
-                        if (currentSessionId !== initialSessionId) {
+                        if (currentSessionId !== initialSessionId || !window.Gaigai.isHistoryTokenCurrent(historyToken)) {
                             console.error(`🛑 [安全拦截] 会话ID不一致！弹窗打开: ${initialSessionId}, 执行时: ${currentSessionId}`);
                             await window.Gaigai.customAlert('🛑 安全拦截：检测到会话切换，已取消操作\n\n请重新打开总结优化功能', '错误');
                             return;
@@ -3326,7 +2931,7 @@
 
                         // 🔒 安全检查4：保存前再次验证会话ID
                         const finalSessionId = m.gid();
-                        if (finalSessionId !== initialSessionId) {
+                        if (finalSessionId !== initialSessionId || !window.Gaigai.isHistoryTokenCurrent(historyToken)) {
                             console.error(`🛑 [安全拦截] 会话ID不一致！弹窗打开: ${initialSessionId}, 保存前: ${finalSessionId}`);
                             await window.Gaigai.customAlert('🛑 安全拦截：检测到会话切换，已取消操作', '错误');
                             return;

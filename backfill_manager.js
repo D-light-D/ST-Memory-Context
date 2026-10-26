@@ -520,6 +520,7 @@
          * 批量执行入口 (修复版：即时响应停止 + 指针隔离)
          */
         async runBatchBackfill(start, end, step = 20, isManual = false, targetIndex = -1, customNote = '', mode = 'chat', isOverwrite = false, forceSilent = false) {
+            const batchToken = window.Gaigai.captureHistoryToken();
             const API_CONFIG = window.Gaigai.config;
             const m = window.Gaigai.m;
             const batches = [];
@@ -591,18 +592,18 @@
                 // --- 循环开始 ---
                 for (let i = 0; i < batches.length; i++) {
                     // 🛑 检查点 1：任务开始前
-                    if (window.Gaigai.stopBatchBackfill) { isUserCancelled = true; break; }
+                    if (window.Gaigai.stopBatchBackfill || !window.Gaigai.isHistoryTokenCurrent(batchToken)) { isUserCancelled = true; break; }
 
                     // 冷却逻辑
                     if (i > 0) {
                         for (let d = 5; d > 0; d--) {
-                            if (window.Gaigai.stopBatchBackfill) break; // 🛑 检查点 2：冷却期间
+                            if (window.Gaigai.stopBatchBackfill || !window.Gaigai.isHistoryTokenCurrent(batchToken)) break; // 🛑 检查点 2：冷却期间
                             updateBtn(`⏳ 冷却 ${d}s... (点此停止)`, true);
                             updateStatus(`批次间冷却... ${d}秒`, '#ffc107');
                             await new Promise(r => setTimeout(r, 1000));
                         }
                     }
-                    if (window.Gaigai.stopBatchBackfill) { isUserCancelled = true; break; }
+                    if (window.Gaigai.stopBatchBackfill || !window.Gaigai.isHistoryTokenCurrent(batchToken)) { isUserCancelled = true; break; }
 
                     const batch = batches[i];
                     const batchNum = i + 1;
@@ -619,6 +620,7 @@
                     
                     while (retryCount <= 1) {
                         try {
+                            if (!window.Gaigai.isHistoryTokenCurrent(batchToken)) { isUserCancelled = true; break; }
                             if (batch.type === 'table') {
                                 // 📊 表格优化
                                 const sheet = m.s[batch.index];
@@ -637,7 +639,7 @@
 
                             // 🛑 检查点 3：API返回后立即检查
                             // 如果在生成过程中点了停止，这里马上生效，不再记录成功状态
-                            if (window.Gaigai.stopBatchBackfill) {
+                            if (window.Gaigai.stopBatchBackfill || !window.Gaigai.isHistoryTokenCurrent(batchToken)) {
                                 console.warn(`🛑 [批量任务] 任务 ${batchNum} 执行期间被中止`);
                                 isUserCancelled = true;
                                 break;
@@ -658,7 +660,7 @@
                             lastError = error;
                             
                             // ✨✨✨ 修复：如果用户已经点了停止，直接退出，不要弹窗问废话
-                            if (window.Gaigai.stopBatchBackfill) {
+                            if (window.Gaigai.stopBatchBackfill || !window.Gaigai.isHistoryTokenCurrent(batchToken)) {
                                 console.warn(`🛑 [批量追溯] 检测到用户停止，跳过异常弹窗`);
                                 isUserCancelled = true;
                                 break;
@@ -674,7 +676,7 @@
                                 
                                 // 等待5秒后重试
                                 for (let retrySec = 5; retrySec > 0; retrySec--) {
-                                    if (window.Gaigai.stopBatchBackfill) {
+                                    if (window.Gaigai.stopBatchBackfill || !window.Gaigai.isHistoryTokenCurrent(batchToken)) {
                                         console.warn(`🛑 [重试等待] 检测到用户停止`);
                                         isUserCancelled = true;
                                         break;
@@ -683,7 +685,7 @@
                                     await new Promise(r => setTimeout(r, 1000));
                                 }
                                 
-                                if (window.Gaigai.stopBatchBackfill) {
+                                if (window.Gaigai.stopBatchBackfill || !window.Gaigai.isHistoryTokenCurrent(batchToken)) {
                                     isUserCancelled = true;
                                     break;
                                 }
@@ -734,24 +736,24 @@ ${lastError.message}
                         console.log('⏳ [Batch Backfill] Cooling down for 5s to avoid rate limit...');
                         // 分秒检查停止标志，确保UI及时响应
                         for (let delay = 5; delay > 0; delay--) {
-                            if (window.Gaigai.stopBatchBackfill) break;
+                            if (window.Gaigai.stopBatchBackfill || !window.Gaigai.isHistoryTokenCurrent(batchToken)) break;
                             updateStatus(`⏳ 冷却中，避免触发限流 (${delay}秒)...`, '#ffc107');
                             await new Promise(r => setTimeout(r, 1000));
                         }
                     }
 
                     // 🛑 检查点：延迟后立即检查停止标志
-                    if (window.Gaigai.stopBatchBackfill) { isUserCancelled = true; break; }
+                    if (window.Gaigai.stopBatchBackfill || !window.Gaigai.isHistoryTokenCurrent(batchToken)) { isUserCancelled = true; break; }
 
                     // 🛑 检查点 4：落盘等待前
-                    if (window.Gaigai.stopBatchBackfill) { isUserCancelled = true; break; }
+                    if (window.Gaigai.stopBatchBackfill || !window.Gaigai.isHistoryTokenCurrent(batchToken)) { isUserCancelled = true; break; }
 
                     // ⏳ 只有在没按停止的时候，才等待落盘
                     // ✅ [修复截断] 增加等待时间从 3 秒到 6 秒，适配 thinking 模型和云同步
                     // ✅ [优化] 将等待改为可中断的循环，提升停止响应速度
                     console.log(`⏳ [IO缓冲] 等待数据完全写入 (6秒)...`);
                     for (let waitSec = 0; waitSec < 6; waitSec++) {
-                        if (window.Gaigai.stopBatchBackfill) {
+                        if (window.Gaigai.stopBatchBackfill || !window.Gaigai.isHistoryTokenCurrent(batchToken)) {
                             console.log(`🛑 [IO缓冲] 检测到停止标志，中断等待`);
                             isUserCancelled = true;
                             break;
@@ -793,6 +795,7 @@ ${lastError.message}
                     return;
                 }
 
+                if (!window.Gaigai.isHistoryTokenCurrent(batchToken)) return;
                 // 保存最终状态
                 if (successCount > 0) {
                     if (typeof window.Gaigai.saveAllSettingsToCloud === 'function') window.Gaigai.saveAllSettingsToCloud();
@@ -835,10 +838,12 @@ ${lastError.message}
          * @param {boolean} skipLoad - 是否跳过加载配置和数据（批量模式下为true，避免数据丢失）
          */
         async autoRunBackfill(start, end, isManual = false, targetIndex = -1, customNote = '', mode = 'chat', isOverwrite = false, forceSilent = null, skipLoad = false) {
+            const requestedChat = window.Gaigai.captureHistoryToken();
             if (!skipLoad) {
                 const loadConfig = window.Gaigai.loadConfig || (() => Promise.resolve());
                 await loadConfig();
             }
+            if (!window.Gaigai.isHistoryTokenCurrent(requestedChat)) return { success: false, reason: 'history_changed' };
 
             const ctx = window.SillyTavern.getContext();
             if (!ctx || !ctx.chat) return { success: false, reason: 'no_context' };
@@ -865,6 +870,7 @@ ${lastError.message}
 
             // 🛡️ [Safe Guard] Capture session ID at start to prevent data bleeding
             const initialSessionId = window.Gaigai.m.gid();
+            const historyToken = window.Gaigai.captureHistoryToken();
 
             // ✨✨✨ 修复：补全 ctx 定义 ✨✨✨
             const ctx = window.SillyTavern.getContext();
@@ -881,6 +887,7 @@ ${lastError.message}
                 m.load();
             }
 
+            const referenceTables = window.Gaigai.memoryTablesAt(end);
             let userName = ctx.name1 || 'User';
             let charName = 'Character';
             if (ctx.characterId !== undefined && ctx.characters && ctx.characters[ctx.characterId]) {
@@ -912,7 +919,7 @@ ${lastError.message}
             // ✅ 优化：将表格数据前置，作为"已归档历史"供 AI 参考
             if (targetIndex === -1) {
                 // 1. 全部表格模式（动态获取所有数据表）
-                m.s.slice(0, -1).forEach((sheet, i) => {
+                referenceTables.slice(0, -1).forEach((sheet, i) => {
                     const sheetName = sheet.n;
                     let sheetContent = sheet.txt(i);
 
@@ -932,7 +939,7 @@ ${lastError.message}
             } else {
                 // 2. 单表模式（动态判断是否为数据表）
                 if (targetIndex >= 0 && targetIndex < m.s.length - 1 && m.s[targetIndex]) {
-                    const sheet = m.s[targetIndex];
+                    const sheet = referenceTables[targetIndex];
                     const sheetName = sheet.n;
                     let sheetContent = sheet.txt(targetIndex);
 
@@ -965,11 +972,11 @@ ${lastError.message}
                 rulesContent = window.Gaigai.PromptManager.DEFAULT_BACKFILL_PROMPT;
             }
 
-            let backfillInstruction = window.Gaigai.PromptManager.resolveVariables(rulesContent, ctx);
+            let backfillInstruction = window.Gaigai.withMemoryView(end, () => window.Gaigai.PromptManager.resolveVariables(rulesContent, ctx));
 
             // 🎯 单表模式指令追加
             if (targetIndex >= 0 && targetIndex < m.s.length - 1 && m.s[targetIndex]) {
-                const sheet = m.s[targetIndex];
+                const sheet = referenceTables[targetIndex];
                 const sheetName = sheet.n;
                 backfillInstruction += `\n\n🎯 【单表追溯模式 - 最终提醒】\n本次追溯只关注且填写【表${targetIndex} - ${sheetName}】，请仅生成该表的 insertRow/updateRow 指令，严禁生成其他表格内容。`;
                 console.log(`🎯 [单表模式] 最终提醒已追加到指令末尾`);
@@ -978,7 +985,7 @@ ${lastError.message}
             // ✅✅✅ [新增] 重构模式指令
             const maxDataTableIndex = m.s.length - 2;
             if (isOverwrite && targetIndex >= 0 && targetIndex <= maxDataTableIndex) {
-                const sheet = m.s[targetIndex];
+                const sheet = referenceTables[targetIndex];
                 const sheetName = sheet.n;
                 backfillInstruction += `\n\n🔥 【重构模式启用】\n⚠️ 用户已启用「重构模式」！\n\n📌 核心要求：\n1. **忽略上述表格的所有旧数据**，它们仅供参考，不是你的填写目标。\n2. 本次追溯将完全基于聊天历史（第 ${start}-${end} 层）重新生成【表${targetIndex} - ${sheetName}】。\n3. 所有指令必须使用 **insertRow(${targetIndex}, {...})**，不要使用 updateRow。\n4. 行索引从 0 开始递增（0, 1, 2, 3...），无需考虑旧数据的索引。\n5. 请完整、系统地提取聊天记录中的所有关键信息，生成全新的表格内容。\n\n💡 提示：这是一次「全新建表」，而不是「增量填表」。`;
                 console.log(`🔥 [重构模式] 已注入特殊指令：目标表${targetIndex}，行范围 ${start}-${end}`);
@@ -1101,6 +1108,7 @@ ${lastError.message}
                     // ✅ 核心修复：递归调用前释放锁（递归会重新获取锁）
                     window.isSummarizing = false;
                     // 用户点击"重试"，递归调用
+                    if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) return { success: false, reason: 'history_changed' };
                     return this.handleChatBackfill(start, end, isManual, targetIndex, customNote, retryCount + 1, isOverwrite, forceSilent, skipLoad);
                 } else {
                     // ✅ 核心修复：返回前释放锁
@@ -1111,7 +1119,7 @@ ${lastError.message}
             }
 
             // 🛡️ [Safe Guard] Check if session changed during API call
-            if (window.Gaigai.m.gid() !== initialSessionId) {
+            if (window.Gaigai.m.gid() !== initialSessionId || !window.Gaigai.isHistoryTokenCurrent(historyToken)) {
                 console.warn(`🛑 [Safe Guard] Session changed during backfill (Old: ${initialSessionId}, New: ${window.Gaigai.m.gid()}). Aborting save.`);
                 // ✅ 核心修复：会话变更，返回前释放锁
                 window.isSummarizing = false;
@@ -1194,36 +1202,14 @@ ${lastError.message}
                             }
                         }
 
-                        const cs = window.Gaigai.tools.prs(innerText);
+                        const cs = window.Gaigai.withMemoryView(end, () => window.Gaigai.tools.prs(innerText));
                         if (cs.length > 0) {
-                            // ✅✅✅ [重构模式] 静默模式下的事务性安全清空
-                            // ✅ 动态判断：targetIndex 必须是有效的数据表索引（排除总结表）
-                            const maxDataTableIdx = m.s.length - 2;
-                            if (isOverwrite && targetIndex >= 0 && targetIndex <= maxDataTableIdx) {
-                                const targetSheet = m.s[targetIndex];
-                                if (targetSheet) {
-                                    const oldRowCount = targetSheet.r.length;
-                                    console.log(`🔥 [重构模式-静默] 开始清空表${targetIndex}，原有 ${oldRowCount} 行数据`);
-
-                                    // 🛡️ [安全备份] 在清空表格前，强制保存当前状态
-                                    console.log('🛡️ [安全备份] 在清空表格前，强制保存当前状态...');
-                                    window.Gaigai.m.save(true, true); // 强制立即保存一份当前状态到 localStorage 历史记录
-                                    // 为当前状态创建一个内存快照，方便回滚
-                                    if (typeof window.Gaigai.saveSnapshot === 'function') {
-                                        window.Gaigai.saveSnapshot('backup_pre_overwrite_' + Date.now());
-                                    }
-
-                                    targetSheet.clear();
-                                    console.log(`✅ [重构模式-静默] 表${targetIndex} 已清空，准备写入 ${cs.length} 条新指令`);
-                                }
-                            }
-
-                            window.Gaigai.tools.exe(cs);
+                            window.Gaigai.commitMemoryOperation(end, () => {
+                                if (isOverwrite && targetIndex >= 0 && targetIndex < m.s.length - 1) m.s[targetIndex].clear();
+                                window.Gaigai.tools.exe(cs);
+                                window.Gaigai.config.lastBackfillIndex = end;
+                            }, { type: 'backfill', start, end });
                             window.lastManualEditTime = Date.now();
-                            window.Gaigai.config.lastBackfillIndex = end;
-                            try { localStorage.setItem('gg_api', JSON.stringify(window.Gaigai.config)); } catch (e) { }
-                            if (typeof window.Gaigai.saveAllSettingsToCloud === 'function') window.Gaigai.saveAllSettingsToCloud().catch(e => { });
-                            m.save(true, true); // 批量填表后立即保存
                             if (typeof window.Gaigai.updateCurrentSnapshot === 'function') {
                                 window.Gaigai.updateCurrentSnapshot();
                             }
@@ -1297,6 +1283,7 @@ ${lastError.message}
                 if (shouldRetry) {
                     // ✅ 核心修复：递归调用前释放锁（递归会重新获取锁）
                     window.isSummarizing = false;
+                    if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) return { success: false, reason: 'history_changed' };
                     return this.handleChatBackfill(start, end, isManual, targetIndex, customNote, retryCount + 1, isOverwrite, forceSilent, skipLoad);
                 }
                 // ✅ 核心修复：返回前释放锁
@@ -1324,6 +1311,7 @@ ${lastError.message}
 
             // 🛡️ [Safe Guard] Capture session ID at start to prevent data bleeding
             const initialSessionId = window.Gaigai.m.gid();
+            const historyToken = window.Gaigai.captureHistoryToken();
 
             // 🛑 验证：表格优化模式必须指定单个表格
             // ✅ 动态判断：targetIndex 必须在有效范围内（0 到 倒数第二个表）
@@ -1456,6 +1444,7 @@ ${lastError.message}
                     // ✅ 核心修复：递归调用前释放锁（递归会重新获取锁）
                     window.isSummarizing = false;
                     // 用户点击"重试"，递归调用
+                    if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) return { success: false, reason: 'history_changed' };
                     return this.handleTableOptimization(startRow, endRow, isManual, targetIndex, customNote, retryCount + 1, forceSilent);
                 } else {
                     // ✅ 核心修复：返回前释放锁
@@ -1466,7 +1455,7 @@ ${lastError.message}
             }
 
             // 🛡️ [Safe Guard] Check if session changed during API call
-            if (window.Gaigai.m.gid() !== initialSessionId) {
+            if (window.Gaigai.m.gid() !== initialSessionId || !window.Gaigai.isHistoryTokenCurrent(historyToken)) {
                 console.warn(`🛑 [Safe Guard] Session changed during table optimization (Old: ${initialSessionId}, New: ${window.Gaigai.m.gid()}). Aborting save.`);
                 // ✅ 核心修复：会话变更，返回前释放锁
                 window.isSummarizing = false;
@@ -1628,6 +1617,7 @@ ${lastError.message}
                 if (shouldRetry) {
                     // ✅ 核心修复：递归调用前释放锁（递归会重新获取锁）
                     window.isSummarizing = false;
+                    if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) return { success: false, reason: 'history_changed' };
                     return this.handleTableOptimization(startRow, endRow, isManual, targetIndex, customNote, retryCount + 1, forceSilent);
                 }
                 // ✅ 核心修复：返回前释放锁
@@ -1643,6 +1633,7 @@ ${lastError.message}
         async _applyTableOptimization(targetIndex, commands, m) {
             // 🔒 安全检查1：验证会话ID
             const initialSessionId = m.gid();
+            const historyToken = window.Gaigai.captureHistoryToken();
             if (!initialSessionId) {
                 console.error('🛑 [安全拦截] 无法获取会话标识');
                 return;
@@ -1658,7 +1649,7 @@ ${lastError.message}
 
             // 🔒 安全检查3：执行前再次验证会话ID
             const currentSessionId = m.gid();
-            if (currentSessionId !== initialSessionId) {
+            if (currentSessionId !== initialSessionId || !window.Gaigai.isHistoryTokenCurrent(historyToken)) {
                 console.error(`🛑 [安全拦截] 会话ID不一致！初始: ${initialSessionId}, 当前: ${currentSessionId}`);
                 return;
             }
@@ -1712,6 +1703,7 @@ ${lastError.message}
 
             // 🔒 关键修复：记录弹窗打开时的会话ID
             const initialSessionId = m.gid();
+            const historyToken = window.Gaigai.captureHistoryToken();
             if (!initialSessionId) {
                 window.Gaigai.customAlert('🛑 安全拦截：无法获取会话标识', '错误');
                 return Promise.resolve({ success: false });
@@ -1812,7 +1804,7 @@ ${lastError.message}
                             return;
                         }
 
-                        if (currentSessionId !== initialSessionId) {
+                        if (currentSessionId !== initialSessionId || !window.Gaigai.isHistoryTokenCurrent(historyToken)) {
                             console.error(`🛑 [安全拦截] 会话ID不一致！弹窗打开: ${initialSessionId}, 执行时: ${currentSessionId}`);
                             await window.Gaigai.customAlert('🛑 安全拦截：检测到会话切换，已取消操作\n\n请重新打开表格优化功能', '错误');
                             return;
@@ -1871,6 +1863,7 @@ ${lastError.message}
 
             // 🔒 关键修复：记录弹窗打开时的会话ID
             const initialSessionId = m.gid();
+            const historyToken = window.Gaigai.captureHistoryToken();
             if (!initialSessionId) {
                 window.Gaigai.customAlert('🛑 安全拦截：无法获取会话标识', '错误');
                 return Promise.resolve({ success: false });
@@ -1990,7 +1983,7 @@ ${lastError.message}
                             return;
                         }
 
-                        if (currentSessionId !== initialSessionId) {
+                        if (currentSessionId !== initialSessionId || !window.Gaigai.isHistoryTokenCurrent(historyToken)) {
                             console.error(`🛑 [安全拦截] 会话ID不一致！弹窗打开: ${initialSessionId}, 执行时: ${currentSessionId}`);
                             await window.Gaigai.customAlert('🛑 安全拦截：检测到会话切换，已取消操作\n\n请重新打开追溯功能', '错误');
                             return;
@@ -1999,7 +1992,7 @@ ${lastError.message}
                         // 解析并执行指令
                         const prs = window.Gaigai.tools.prs;
                         const exe = window.Gaigai.tools.exe;
-                        const cs = prs(finalContent);
+                        const cs = window.Gaigai.withMemoryView(newIndex ?? m.ctx().chat.length, () => prs(finalContent));
 
                         // ✨✨✨ [Key Mapping/Sanitization] Convert column names to indices
                         // Fix: AI sometimes outputs {"Name": "Alice"} instead of {0: "Alice"}
@@ -2063,7 +2056,7 @@ ${lastError.message}
 
                         // 🔒 安全检查2：执行前再次验证会话ID
                         const finalSessionId = m.gid();
-                        if (finalSessionId !== initialSessionId) {
+                        if (finalSessionId !== initialSessionId || !window.Gaigai.isHistoryTokenCurrent(historyToken)) {
                             console.error(`🛑 [安全拦截] 会话ID不一致！弹窗打开: ${initialSessionId}, 执行前: ${finalSessionId}`);
                             await window.Gaigai.customAlert('🛑 安全拦截：检测到会话切换，已取消操作', '错误');
                             return;
@@ -2090,58 +2083,14 @@ ${lastError.message}
 
                         console.log(`🔒 [安全验证通过] 会话ID: ${finalSessionId}, 指令数: ${cs.length}`);
 
-                        // ✅✅✅ [重构模式] 事务性安全清空：只在解析成功、用户确认后才清空
-                        // ✅ 动态判断：targetIndex 必须是有效的数据表索引（排除总结表）
-                        // ✅ 复用上面安全检查3中定义的 maxDataTableIdx 变量
-                        if (regenParams && regenParams.isOverwrite && regenParams.targetIndex >= 0 && regenParams.targetIndex <= maxDataTableIdx) {
-                            const targetSheet = m.s[regenParams.targetIndex];
-                            if (targetSheet) {
-                                const oldRowCount = targetSheet.r.length;
-                                console.log(`🔥 [重构模式] 开始清空表${regenParams.targetIndex}，原有 ${oldRowCount} 行数据`);
-
-                                // 🛡️ [安全备份] 在清空表格前，强制保存当前状态
-                                console.log('🛡️ [安全备份] 在清空表格前，强制保存当前状态...');
-                                window.Gaigai.m.save(true, true); // 强制立即保存一份当前状态到 localStorage 历史记录
-                                // 为当前状态创建一个内存快照，方便回滚
-                                if (typeof window.Gaigai.saveSnapshot === 'function') {
-                                    window.Gaigai.saveSnapshot('backup_pre_overwrite_' + Date.now());
-                                }
-
-                                targetSheet.clear();
-                                console.log(`✅ [重构模式] 表${regenParams.targetIndex} 已清空，准备写入 ${cs.length} 条新指令`);
-                            }
-                        }
-
-                        // 执行写入
-                        exe(cs);
+                        const end = newIndex ?? m.ctx().chat.length;
+                        window.Gaigai.commitMemoryOperation(end, () => {
+                            if (regenParams?.isOverwrite && regenParams.targetIndex >= 0
+                                && regenParams.targetIndex < m.s.length - 1) m.s[regenParams.targetIndex].clear();
+                            exe(cs);
+                            window.Gaigai.config.lastBackfillIndex = end;
+                        }, { type: 'backfill', start: regenParams?.start ?? 0, end });
                         window.lastManualEditTime = Date.now();
-
-                        // 更新进度指针
-                        if (newIndex !== null) {
-                            window.Gaigai.config.lastBackfillIndex = newIndex;
-                            try { localStorage.setItem('gg_api', JSON.stringify(window.Gaigai.config)); } catch (e) { }
-                        }
-
-                        if (typeof window.Gaigai.saveAllSettingsToCloud === 'function') window.Gaigai.saveAllSettingsToCloud().catch(e => { });
-
-                        // 🔒 安全检查4：保存前第三次验证会话ID（防止执行期间切换会话）
-                        const saveSessionId = m.gid();
-                        if (saveSessionId !== initialSessionId) {
-                            console.error(`🛑 [安全拦截] 会话ID不一致！弹窗打开: ${initialSessionId}, 保存时: ${saveSessionId}`);
-                            await window.Gaigai.customAlert('🛑 安全拦截：检测到会话切换，数据未保存\n\n警告：已执行的指令无法回滚，请检查数据完整性！', '严重错误');
-                            $o.remove();
-                            // ✅ 核心修复：会话切换错误，返回前释放锁
-                            window.isSummarizing = false;
-                            resolve({ success: false });
-                            return;
-                        }
-
-                        console.log(`🔒 [最终验证通过] 会话ID: ${saveSessionId}, 准备保存数据`);
-
-                        m.save(true, true); // 批量填表后立即保存
-                        if (typeof window.Gaigai.updateCurrentSnapshot === 'function') {
-                            window.Gaigai.updateCurrentSnapshot();
-                        }
 
                         // ✨ [UI Refresh] Update tab counts to reflect new row counts
                         const affectedTables = new Set();
@@ -2178,6 +2127,8 @@ ${lastError.message}
         async _regenerateContent(regenParams, $editor) {
             const ctx = window.SillyTavern.getContext();
             const m = window.Gaigai.m;
+            const historyToken = window.Gaigai.captureHistoryToken();
+            const referenceTables = window.Gaigai.memoryTablesAt(regenParams.end);
             let userName = ctx.name1 || 'User';
             let charName = 'Character';
             if (ctx.characterId !== undefined && ctx.characters && ctx.characters[ctx.characterId]) {
@@ -2230,7 +2181,7 @@ ${lastError.message}
             // 🆕 根据 targetIndex 决定插入哪些表格状态
             if (targetIndex === -1) {
                 // 全部表格模式（动态获取所有数据表）
-                m.s.slice(0, -1).forEach((sheet, i) => {
+                referenceTables.slice(0, -1).forEach((sheet, i) => {
                     const sheetName = sheet.n; // 获取表名
                     let sheetContent = sheet.txt(i);
 
@@ -2251,7 +2202,7 @@ ${lastError.message}
             } else {
                 // 单表模式（动态判断是否为数据表）
                 if (targetIndex >= 0 && targetIndex < m.s.length - 1 && m.s[targetIndex]) {
-                    const sheet = m.s[targetIndex];
+                    const sheet = referenceTables[targetIndex];
                     const sheetName = sheet.n;
                     let sheetContent = sheet.txt(targetIndex);
 
@@ -2298,7 +2249,7 @@ ${lastError.message}
 
             // 🎯 [关键修复] 单表模式指令直接拼接到 finalInstruction 后面
             if (targetIndex >= 0 && targetIndex < m.s.length - 1 && m.s[targetIndex]) {
-                const sheet = m.s[targetIndex];
+                const sheet = referenceTables[targetIndex];
                 const sheetName = sheet.n;
                 finalInstruction += `\n\n🎯 【单表追溯模式 - 最终提醒】\n本次追溯只关注【表${targetIndex} - ${sheetName}】，请仅生成该表的 insertRow/updateRow 指令，严禁生成其他表格内容。`;
             }
@@ -2331,6 +2282,7 @@ ${lastError.message}
                 window.isSummarizing = false;
             }
 
+            if (!window.Gaigai.isHistoryTokenCurrent(historyToken)) return;
             if (result && result.success) {
                 // 🛑 [优化] 在解析和保存数据之前检查停止标志
                 if (window.Gaigai.stopBatchBackfill) {

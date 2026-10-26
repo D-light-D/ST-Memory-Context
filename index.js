@@ -199,6 +199,251 @@
     let saveChatDebounceTimer = null; // 🧹 性能优化：saveChat 防抖计时器
     let hideTagDebounceTimer = null; // 🧹 性能优化：hideMemoryTags 防抖计时器，防止 Regex 脚本冲突
     let isChatSwitching = false; // 🔒 性能优化：会话切换锁，防止卡顿期间误操作
+    let memoryHistory = null;
+    let historyApplying = false;
+    let historyEpoch = 0;
+    let historyNeedsDerivedSync = false;
+    let chatSwitchRevision = 0;
+    const memoryRowIds = new WeakMap();
+
+    function rowId(row) {
+        if (!memoryRowIds.has(row)) memoryRowIds.set(row,
+            window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`);
+        return memoryRowIds.get(row);
+    }
+
+    function historyIdentity() {
+        const ctx = m.ctx();
+        if (!ctx?.chatId) return null;
+        const owner = ctx.groupId != null
+            ? `group:${ctx.groupId}`
+            : `character:${ctx.characters?.[ctx.characterId]?.avatar || (ctx.characterId ?? ctx.name2)}`;
+        return { owner, chatName: String(ctx.chatId), integrity: ctx.chatMetadata?.integrity || '',
+            session: JSON.stringify([owner, String(ctx.chatId)]) };
+    }
+
+    function legacyChatId() {
+        const ctx = m.ctx();
+        const chat = ctx?.chatMetadata?.file_name || ctx?.chatId;
+        if (!chat) return null;
+        if (ctx.groupId) return `Group_${ctx.groupId}_${chat}`;
+        return C.pc ? `${ctx.characterId || ctx.name2}_${chat}` : String(chat);
+    }
+
+    function captureMemoryState() {
+        const state = { count: m.s.length, summarized: {},
+            progress: { lastBf: API_CONFIG.lastBackfillIndex || 0, lastSum: API_CONFIG.lastSummaryIndex || 0,
+                lastBigSum: API_CONFIG.lastBigSummaryIndex || 0 } };
+        m.s.forEach((sheet, i) => {
+            state[`sheet_${i}`] = structuredClone(sheet.json());
+            state[`rowIds_${i}`] = sheet.r.map(rowId);
+            state.summarized[i] = (summarizedRows[i] || []).map(ri => state[`rowIds_${i}`][ri]).filter(Boolean);
+        });
+        return state;
+    }
+
+    function applyMemoryState(state) {
+        m.s = Array.from({ length: state.count }, (_, i) => {
+            const data = state[`sheet_${i}`];
+            // Summary previews and table editors hold Sheet references across awaits.
+            const current = m.s[i];
+            const sheet = current && current.n === data.n && JSON.stringify(current.c) === JSON.stringify(data.c)
+                ? current : new S(data.n, [...data.c]);
+            sheet.from(structuredClone(data));
+            sheet.r.forEach((row, ri) => memoryRowIds.set(row, state[`rowIds_${i}`]?.[ri]
+                || window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`));
+            return sheet;
+        });
+        summarizedRows = {};
+        for (const [ti, ids] of Object.entries(state.summarized || {})) {
+            summarizedRows[ti] = ids.map(id => (state[`rowIds_${ti}`] || []).indexOf(id)).filter(i => i >= 0);
+        }
+        API_CONFIG.lastBackfillIndex = state.progress?.lastBf || 0;
+        API_CONFIG.lastSummaryIndex = state.progress?.lastSum || 0;
+        API_CONFIG.lastBigSummaryIndex = state.progress?.lastBigSum || 0;
+        localStorage.setItem(AK, JSON.stringify(API_CONFIG));
+    }
+
+    // Use exactly the same deterministic commands for live writes and history reconstruction.
+    function applyMemoryCommands(commands) {
+        for (const cm of commands) {
+            const sheet = m.get(cm.ti);
+            if (!sheet) continue;
+            if (cm.t === 'update' && cm.ri !== null) sheet.upd(cm.ri, cm.d);
+            if (cm.t === 'insert') sheet.ins(cm.d);
+            if (cm.t === 'delete' && cm.ri !== null) sheet.del(cm.ri);
+        }
+    }
+
+    function attachMemoryHistory(savedData) {
+        const api = window.Gaigai.History;
+        const identity = historyIdentity();
+        if (!api || !identity) return;
+        const ctx = m.ctx();
+        // Old releases marked auto-hides as ordinary is_system flags. Only adopt a
+        // contiguous hidden prefix; isolated manual hides remain user-owned.
+        if (savedData?.d && !savedData.history && !ctx.chatMetadata.gaigai_visibility_version
+            && (C.contextLimit || C.autoSummaryHideContext)) {
+            const dialogue = ctx.chat.filter(msg => msg.role !== 'system' && !msg.isGaigaiPrompt && !msg.isGaigaiData);
+            const start = dialogue[0]?.is_system ? 0 : 1;
+            let end = start;
+            while (end < dialogue.length && dialogue[end].is_system) end++;
+            if (end - start >= 2) {
+                for (const msg of dialogue.slice(start, end)) {
+                    msg.extra = msg.extra || {};
+                    msg.extra.gaigai_visibility = { originalSystem: false, hidden: true };
+                }
+            }
+        }
+        ctx.chatMetadata.gaigai_visibility_version = 1;
+        const state = captureMemoryState();
+        const empty = structuredClone(state);
+        for (let i = 0; i < empty.count; i++) {
+            empty[`sheet_${i}`].r = [];
+            empty[`rowIds_${i}`] = [];
+        }
+        empty.summarized = {};
+        empty.progress = { lastBf: 0, lastSum: 0, lastBigSum: 0 };
+        memoryHistory = new api.MemoryHistory(identity, empty, savedData?.history,
+            !!savedData?.history && savedData.history.session !== identity.session);
+        historyNeedsDerivedSync = true;
+        const chain = api.prefixes(m.ctx().chat || []);
+        if (!savedData?.history && savedData?.d && !savedData.legacyParent) {
+            // Old versions did not store operations. Preserve their current state at its known boundary.
+            memoryHistory.record(state, chain, chain.length - 1, true);
+            for (let at = 1; at < chain.length; at++) memoryHistory.markApplied(chain, at);
+        }
+        reconcileMemoryHistory();
+    }
+
+    function reconcileMemoryHistory() {
+        const ctx = m.ctx();
+        if (!memoryHistory || memoryHistory.identity.session !== m.gid() || !ctx?.chat || historyApplying) return false;
+        const chain = window.Gaigai.History.prefixes(ctx.chat);
+        const version = `${chain.length}:${chain[chain.length - 1]}:${C.enabled}:${C.autoBackfill}`;
+        if (memoryHistory.lastSeen === version) return false;
+        historyApplying = true;
+        let changed = false;
+        try {
+            const result = memoryHistory.reconcile(chain);
+            changed = result.changed;
+            if (changed) historyNeedsDerivedSync = true;
+            if (changed) historyEpoch++;
+            applyMemoryState(memoryHistory.state);
+            // Rebuild only unprocessed real-time commands; never make an AI call during replay.
+            if (C.enabled && !C.autoBackfill) {
+                ctx.chat.forEach((msg, i) => {
+                    const at = i + 1;
+                    if (memoryHistory.hasApplied(chain, at)) return;
+                    if (!msg.is_user && msg.role !== 'system' && !msg.isGaigaiPrompt && !msg.isGaigaiData) {
+                        const commands = prs(msg.mes ?? msg.swipes?.[msg.swipe_id ?? 0] ?? '');
+                        if (commands.length) {
+                            applyMemoryCommands(commands);
+                            API_CONFIG.lastBackfillIndex = at;
+                        }
+                    }
+                    memoryHistory.record(captureMemoryState(), chain, at);
+                    memoryHistory.markApplied(chain, at);
+                    changed = true;
+                });
+            }
+            if (result.lostLegacy && typeof toastr !== 'undefined') {
+                toastr.warning('已回退到升级前的历史范围。旧版未保存操作记录，已从保留消息中的 Memory 指令重建；旧批量填表和手动修改无法精确还原。', '历史记忆重建', { timeOut: 10000 });
+            }
+            memoryHistory.lastSeen = version;
+        } finally { historyApplying = false; }
+        return changed;
+    }
+
+    function captureHistoryToken() {
+        reconcileMemoryHistory();
+        const chat = m.ctx()?.chat || [];
+        const chain = window.Gaigai.History.prefixes(chat);
+        return { session: m.gid(), epoch: historyEpoch, at: chat.length, prefix: chain[chat.length] };
+    }
+
+    function withMemoryView(end, callback) {
+        if (!memoryHistory) return callback();
+        const current = captureMemoryState();
+        const wasApplying = historyApplying;
+        try {
+            historyApplying = true;
+            const chat = m.ctx()?.chat || [];
+            const at = Math.max(0, Math.min(Number(end), chat.length));
+            applyMemoryState(memoryHistory.view(window.Gaigai.History.prefixes(chat.slice(0, at))));
+            return callback();
+        } finally {
+            applyMemoryState(current);
+            historyApplying = wasApplying;
+        }
+    }
+
+    // Only synchronous mutations run in this scope; no shared anchor survives an await.
+    function commitMemoryOperation(end, callback, source = {}) {
+        if (!memoryHistory || isChatSwitching || m.id !== m.gid()) return false;
+        const chain = window.Gaigai.History.prefixes(m.ctx().chat || []);
+        const at = Math.max(0, Math.min(Number(end), chain.length - 1));
+        let state;
+        const result = withMemoryView(at, () => {
+            const value = callback();
+            if (value?.then) throw new Error('Memory transactions must be synchronous');
+            state = captureMemoryState();
+            return value;
+        });
+        memoryHistory.insert(state, chain, at, source);
+        applyMemoryState(memoryHistory.state);
+        historyNeedsDerivedSync = true;
+        m.save(true, true);
+        return result;
+    }
+
+    function memoryTablesAt(end) {
+        return withMemoryView(end, () => m.s.map((sheet, ti) => {
+            const clone = new S(sheet.n, [...sheet.c]);
+            clone.historyTableIndex = ti;
+            clone.from(structuredClone(sheet.json()));
+            const hidden = structuredClone(summarizedRows);
+            clone.txt = () => {
+                const current = summarizedRows;
+                try { summarizedRows = hidden; return S.prototype.txt.call(clone, ti); }
+                finally { summarizedRows = current; }
+            };
+            return clone;
+        }));
+    }
+
+    function isHistoryTokenCurrent(token) {
+        if (!token || isChatSwitching || token.session !== m.gid() || token.epoch !== historyEpoch) return false;
+        return window.Gaigai.History.prefixes(m.ctx()?.chat || [])[token.at] === token.prefix;
+    }
+
+    function refreshMemoryView() {
+        if ($('#gai-main-pop').length) shw();
+    }
+
+    function isMemoryBackupKey(key) {
+        if (!key.startsWith('gg_data_')) return false;
+        try {
+            const data = JSON.parse(localStorage.getItem(key));
+            return !!data?.id && key === `gg_data_${data.id}_${data.ts}`;
+        } catch { return false; }
+    }
+
+    function syncMemoryHistory(forceSave = false) {
+        if (isChatSwitching || !memoryHistory) return;
+        const changed = reconcileMemoryHistory();
+        const visibilityChanged = window.Gaigai.reconcileMessageVisibility?.();
+        if (changed || forceSave || visibilityChanged) m.save(true, true);
+        if (changed || historyNeedsDerivedSync) {
+            historyNeedsDerivedSync = false;
+            window.Gaigai.WI?.resetState();
+            if (C.syncWorldInfo) window.Gaigai.WI?.syncToWorldInfo(null, true);
+            if (C.autoVectorizeSummary || window.Gaigai.VM?.library?.[`summary_book_${m.gid()}`]) {
+                window.Gaigai.VM?.syncSummaryToBook(false);
+            }
+        }
+        if (changed) refreshMemoryView();
+    }
 
     // 🛡️ [辅助函数] 更新 lastManualEditTime 并同步到 window
     // 确保内部变量和外部模块（backfill_manager.js）的 window.lastManualEditTime 保持同步
@@ -1278,6 +1523,7 @@
 
         // ✨✨✨ 核心修复：增强版熔断保护 (防止空数据覆盖)
         save(force = false, immediate = false) {
+            if (historyApplying) return;
             // 🛡️[终极防空盾]：如果当前正在切换会话/加载数据，绝对禁止任何保存行为！
             if (typeof isChatSwitching !== 'undefined' && isChatSwitching) {
                 console.log('🛡️ [保存拦截] 会话正在加载中，禁止保存以防将临时空表写入硬盘！');
@@ -1286,6 +1532,8 @@
 
             const id = this.gid();
             if (!id) return;
+            // A UI callback from the previous chat must never save into the newly selected file.
+            if (this.id !== id || memoryHistory?.identity.session !== id) return;
             const ctx = this.ctx();
 
             // 计算当前内存中的总行数
@@ -1295,7 +1543,7 @@
             // 场景1：用户打开酒馆，插件加载失败(内存为0)，但本地存档其实是有货的。
             // 场景2：加载延迟导致内存中只有1行新数据，但本地存档有100行。
             // 此时如果触发自动保存，本地存档就会被覆盖。必须拦截！
-            if (!force) {
+            if (!force && !memoryHistory) {
                 try {
                     const rawLocalData = localStorage.getItem(`${SK}_${id}`);
                     // 如果本地有存档
@@ -1324,8 +1572,14 @@
                 }
             }
 
-            const now = Date.now();
+            const now = Math.max(Date.now(), lastInternalSaveTime + 1);
             lastInternalSaveTime = now;
+
+            const summaryKey = `sheet_${this.s.length - 1}`;
+            if (JSON.stringify(memoryHistory.state[summaryKey]) !== JSON.stringify(this.s.at(-1)?.json())) {
+                historyNeedsDerivedSync = true;
+            }
+            memoryHistory.record(captureMemoryState(), window.Gaigai.History.prefixes(ctx.chat || []));
 
             const data = {
                 v: V,
@@ -1336,6 +1590,7 @@
                 structureBound: this.structureBound, // ✅ 保存结构绑定状态
                 wiConfig: this.wiConfig, // ✅ 保存世界书自定义配置
                 summarized: summarizedRows,
+                history: memoryHistory.export(),
                 colWidths: userColWidths,
                 rowHeights: userRowHeights,
                 // ✅ 新增：保存当前 API 进度指针到这个角色的存档里
@@ -1432,7 +1687,7 @@
                                 // 紧急清理：删除所有本插件的旧备份
                                 let cleanedCount = 0;
                                 Object.keys(localStorage).forEach(key => {
-                                    if (key.startsWith('gg_data_')) {
+                                    if (isMemoryBackupKey(key)) {
                                         localStorage.removeItem(key);
                                         cleanedCount++;
                                     }
@@ -1490,7 +1745,7 @@
                     let cleanedCount = 0;
                     try {
                         Object.keys(localStorage).forEach(key => {
-                            if (key.startsWith('gg_data_')) {
+                            if (isMemoryBackupKey(key)) {
                                 localStorage.removeItem(key);
                                 cleanedCount++;
                             }
@@ -1535,6 +1790,7 @@
 
                             saveChatDebounceTimer = setTimeout(() => {
                                 try {
+                                    if (id !== this.gid() || isChatSwitching) return;
                                     ctx.saveChat();
                                     // 如果是因为缓存失败而强制同步，显示成功提示
                                     if (!saveToBrowserSuccess && typeof toastr !== 'undefined') {
@@ -1560,6 +1816,9 @@
             }
 
             if (this.id !== id) {
+                historyEpoch++;
+                this.wiConfig = { bookName: '' };
+                this.structureBound = false;
                 // 🔄 检测到会话切换
                 console.log(`🔄 [M.load] 检测到会话切换: ${this.id || 'null'} → ${id}`);
                 this.id = id;
@@ -1581,83 +1840,65 @@
 
             let cloudData = null;
             let localData = null;
-            let needMigrationSave = false; // 标记是否需要迁移保存
+            let inheritedLocalBranch = false;
 
             if (C.cloudSync) { try { const ctx = this.ctx(); if (ctx && ctx.chatMetadata && ctx.chatMetadata.gaigai) cloudData = ctx.chatMetadata.gaigai; } catch (e) { } }
 
-            // 🛡️♻️ [智能数据迁移] 检查云端数据 ID
-            if (cloudData) {
-                if (!cloudData.id) {
-                    console.warn(`🛑 [数据校验] 云端数据缺少 ID 字段，已忽略`);
-                    cloudData = null;
-                } else if (cloudData.id !== id) {
-                    // ♻️ 关键修复：不丢弃数据，而是执行智能迁移
-                    // 由于 ochat 已经清空了内存，此时的 cloudData 一定来自当前文件
-                    // 如果 ID 不匹配，说明是改名/分支操作，应该继承数据而非丢弃
-                    console.log(`♻️ [数据迁移] 检测到会话改名或分支操作`);
-                    console.log(`   - 原始 ID: ${cloudData.id}`);
-                    console.log(`   - 当前 ID: ${id}`);
-                    console.log(`   - 处理方式: 自动迁移数据到新 ID`);
-
-                    // 更新数据中的 ID 为当前 ID
-                    cloudData.id = id;
-                    needMigrationSave = true; // 标记需要保存
-
-                    console.log(`✅ [数据迁移] ID 已更新，将在加载完成后持久化`);
-                } else {
-                    console.log(`✅ [数据校验] 云端数据 ID 校验通过: ${id}`);
+            // The metadata belongs to the open file, but may have been copied from a parent.
+            // Never adopt a different character's journal or an unrelated chat's local cache.
+            const identity = historyIdentity();
+            const normalName = value => String(value || '').replace(/\.jsonl$/i, '');
+            const accepts = (data, fromFile) => {
+                if (!data?.id) return false;
+                if (data.history) {
+                    if (data.history.owner !== identity.owner) return false;
+                    if (data.history.session === id) return true;
+                    if (!fromFile) return false;
+                    const parent = this.ctx()?.chatMetadata?.main_chat;
+                    const renamed = identity.integrity && identity.integrity === data.history.integrity;
+                    return renamed || (parent && normalName(parent) === normalName(data.history.chatName));
                 }
-            }
-
-            try { const sv = localStorage.getItem(`${SK}_${id}`); if (sv) localData = JSON.parse(sv); } catch (e) { }
-
-            // 🛡️♻️ [智能数据迁移] 检查本地数据 ID
-            if (localData) {
-                if (!localData.id) {
-                    console.warn(`🛑 [数据校验] 本地数据缺少 ID 字段，已忽略`);
-                    localData = null;
-                } else if (localData.id !== id) {
-                    // ♻️ 本地数据也可能需要迁移（例如从旧版本升级）
-                    console.log(`♻️ [数据迁移] 本地数据 ID 不匹配，执行迁移`);
-                    console.log(`   - 原始 ID: ${localData.id}`);
-                    console.log(`   - 当前 ID: ${id}`);
-
-                    localData.id = id;
-                    needMigrationSave = true;
-
-                    console.log(`✅ [数据迁移] 本地数据 ID 已更新`);
-                } else {
-                    console.log(`✅ [数据校验] 本地数据 ID 校验通过: ${id}`);
-                }
-            }
-
-            // 🛡️ [严重失血保护] 计算数据行数，防止云端空数据覆盖本地有效数据
-            const countRows = (data) => {
-                if (!data || !data.d || !Array.isArray(data.d)) return 0;
-                return data.d.reduce((total, sheet) => {
-                    if (!sheet || !sheet.r || !Array.isArray(sheet.r)) return total;
-                    return total + sheet.r.length;
-                }, 0);
+                // Legacy metadata is trusted only in its own file, or an explicitly created branch.
+                return fromFile && (data.id === id || data.id === legacyChatId()
+                    || !!this.ctx()?.chatMetadata?.main_chat);
             };
+            if (cloudData) cloudData = accepts(cloudData, true) ? structuredClone(cloudData) : null;
+            try {
+                const raw = localStorage.getItem(`${SK}_${id}`);
+                if (raw) localData = JSON.parse(raw);
+                if (!localData && this.ctx()?.chatMetadata?.main_chat) {
+                    const parentName = normalName(this.ctx().chatMetadata.main_chat);
+                    const parentId = JSON.stringify([identity.owner, parentName]);
+                    const parent = JSON.parse(localStorage.getItem(`${SK}_${parentId}`) || 'null');
+                    if (parent?.history?.owner === identity.owner && parent.history.session === parentId) {
+                        localData = parent;
+                        inheritedLocalBranch = true;
+                    }
+                }
+                // Only legacy per-character keys are unambiguous enough to migrate from browser storage.
+                if (!localData && (C.pc || this.ctx()?.groupId)) {
+                    const legacy = localStorage.getItem(`${SK}_${legacyChatId()}`);
+                    if (legacy) {
+                        const parsed = JSON.parse(legacy);
+                        if (parsed.id === legacyChatId()) localData = parsed;
+                    }
+                }
+            } catch (e) { console.warn('[Memory History] Cannot read chat cache', e); }
+            if (localData && !inheritedLocalBranch && !accepts(localData, false) && !( !localData.history && localData.id === legacyChatId()
+                && (C.pc || this.ctx()?.groupId))) localData = null;
+            if (cloudData && !cloudData.history && cloudData.id !== legacyChatId()
+                && this.ctx()?.chatMetadata?.main_chat) {
+                cloudData.legacyParent = true;
+                if (typeof toastr !== 'undefined') toastr.warning('此分支来自没有操作历史的旧存档，已按分支内的 Memory 指令重建。旧批量填表和手动编辑需要重新整理。', '旧分支迁移', { timeOut: 10000 });
+            }
+            if (cloudData && cloudData.id !== id) {
+                cloudData.id = id;
+            }
 
             let finalData = null;
             if (cloudData && localData) {
-                // ✅ 双重存在检查：云端和本地数据都存在时才进行防暴跌校验
-                const localRowCount = countRows(localData);
-                const cloudRowCount = countRows(cloudData);
-
-                // 🚨 严重失血检测：必须同时满足以下所有条件
-                // 1. localData 存在且有效（已在外层 if 检查）
-                // 2. cloudData 存在且有效（已在外层 if 检查）
-                // 3. 本地有实质数据 (>5行)
-                // 4. 云端数据暴跌超过50%
-                if (localRowCount > 5 && cloudRowCount < (localRowCount * 0.5)) {
-                    console.warn(`⚠️ [严重失血保护] 检测到云端数据异常丢失，强制回退本地。本地行数: ${localRowCount}, 云端行数: ${cloudRowCount}`);
-                    finalData = localData;
-                } else {
-                    // 正常情况：标准时间戳对比
-                    finalData = (cloudData.ts > localData.ts) ? cloudData : localData;
-                }
+                // A smaller journal can be a legitimate rollback. Row count is not a version.
+                finalData = (cloudData.ts > localData.ts) ? cloudData : localData;
             } else if (cloudData) {
                 // 仅云端数据存在（本地数据不存在或无效）
                 finalData = cloudData;
@@ -1768,61 +2009,12 @@
                 lastInternalSaveTime = finalData.ts;
             }
 
-            // ♻️ [数据迁移] 如果执行了 ID 迁移，立即保存以持久化新 ID
-            if (needMigrationSave) {
-                console.log('💾 [数据迁移] 正在持久化迁移后的数据...');
-                setTimeout(() => {
-                    this.save(true); // 强制保存
-                    console.log('✅ [数据迁移] 迁移完成，新 ID 已写入存储');
-                }, 100); // 短暂延迟，确保数据加载完成
-            }
+            attachMemoryHistory(finalData);
+            // Loading a branch must write its reconciled journal, never the parent's latest state.
+            if (memoryHistory && !isChatSwitching) this.save(true, true);
         }
 
-        gid() {
-            try {
-                const x = this.ctx();
-                if (!x) {
-                    console.log('🔍 [gid] 无法获取上下文，返回 null');
-                    return null;
-                }
-
-                // 1. 获取聊天文件 ID (时间线标识)
-                // 诊断显示 file_name 为 undefined，但 chatId 有值，所以必须做兼容
-                const chatId = x.chatMetadata?.file_name || x.chatId;
-                if (!chatId) {
-                    console.log('🔍 [gid] chatId 不存在，返回 null');
-                    return null;
-                }
-
-                // 2. ✅【群聊模式核心修复】
-                // 诊断显示 groupName 为 undefined，但 groupId (如 1767964998110) 存在。
-                // 只要存在 groupId，就强制锁定为群聊存档，忽略当前发言角色。
-                if (x.groupId) {
-                    const generatedId = `Group_${x.groupId}_${chatId}`;
-                    console.log(`🔍 [gid] 群聊模式 - 生成 ID: ${generatedId}`);
-                    return generatedId;
-                }
-
-                // 3. 单人角色模式 (保持原逻辑)
-                if (C.pc) {
-                    const charId = x.characterId || x.name2;
-                    if (!charId) {
-                        console.log('🔍 [gid] 单人模式但 charId 不存在，返回 null');
-                        return null;
-                    }
-                    const generatedId = `${charId}_${chatId}`;
-                    console.log(`🔍 [gid] 单人角色模式 - 生成 ID: ${generatedId}`);
-                    return generatedId;
-                }
-
-                // 4. 纯聊天文件模式 (兜底)
-                console.log(`🔍 [gid] 纯聊天文件模式 - 生成 ID: ${chatId}`);
-                return chatId;
-            } catch (e) {
-                console.error('❌ [gid] 生成 ID 时发生错误:', e);
-                return null;
-            }
-        }
+        gid() { return historyIdentity()?.session || null; }
 
         ctx() { return (typeof SillyTavern !== 'undefined' && SillyTavern.getContext) ? SillyTavern.getContext() : null; }
 
@@ -1936,6 +2128,8 @@
     }
 
     function saveSnapshot(msgIndex) {
+        if (memoryHistory) return;
+
         try {
             const snapshot = {
                 data: m.all().slice(0, -1).map(sh => structuredClone(sh.json())), // ✅ 只保存数据表，不保存总结表
@@ -1946,7 +2140,7 @@
             // 🧹 [新增] 主动清理过期备份，防止 localStorage 配额超限
             try {
                 const allKeys = Object.keys(localStorage);
-                const backupKeys = allKeys.filter(k => k.startsWith('gg_data_') || k.startsWith('backup_pre_'));
+                const backupKeys = allKeys.filter(k => isMemoryBackupKey(k) || k.startsWith('backup_pre_'));
 
                 if (backupKeys.length > 15) {
                     // 按时间戳排序，删除最旧的备份
@@ -2017,7 +2211,7 @@
                     let cleanedCount = 0;
 
                     allKeys.forEach(key => {
-                        if (key.startsWith('gg_data_') || key.startsWith('backup_pre_')) {
+                        if (isMemoryBackupKey(key) || key.startsWith('backup_pre_')) {
                             try {
                                 localStorage.removeItem(key);
                                 cleanedCount++;
@@ -2071,6 +2265,8 @@
     // ✅✅✅ [核心修复] 强力回档函数 (最终逻辑修正版)
     // ✅✅✅ [核心修复] 强力回档函数 (支持强制模式)
     function restoreSnapshot(msgIndex, force = false) {
+        if (memoryHistory) { syncMemoryHistory(); return true; }
+
         try {
             const key = msgIndex.toString();
             const snapshot = snapshotHistory[key];
@@ -3211,7 +3407,7 @@ updateRow(1, 0, {4: "王五销毁了图纸..."})
 
         // ✅ [修复] 刷新被修改的表格 UI，确保新增行立即显示
         modifiedTables.forEach(ti => {
-            if (typeof refreshTable === 'function') {
+            if (!historyApplying && $('#gai-main-pop').length && typeof refreshTable === 'function') {
                 refreshTable(ti);
                 console.log(`🔄 [exe] 已刷新表${ti}的UI`);
             }
@@ -10622,6 +10818,7 @@ updateRow(1, 0, {4: "王五销毁了图纸..."})
             return;
         }
 
+        const requestedSession = m.gid();
         console.log('🔄 [配置同步] 开始拉取云端配置...');
 
         let serverData = null;
@@ -10651,6 +10848,8 @@ updateRow(1, 0, {4: "王五销毁了图纸..."})
         } catch (e) {
             console.warn('⚠️ [配置同步] 网络请求失败，将使用本地缓存:', e);
         }
+
+        if (requestedSession !== m.gid()) return;
 
         // ================= 🛡️ 核心防御：空数据拦截 🛡️ =================
         // 如果服务器返回 null，或者 config 对象不存在，说明数据损坏或未初始化。
@@ -10695,16 +10894,9 @@ updateRow(1, 0, {4: "王五销毁了图纸..."})
 
                 Object.assign(API_CONFIG, serverData.api);
 
-                // 恢复运行时指针（防止云端旧指针覆盖本地新进度）
-                if (currentSumIdx !== undefined && currentSumIdx > (serverData.api.lastSummaryIndex || 0)) {
-                    API_CONFIG.lastSummaryIndex = currentSumIdx;
-                }
-                if (currentBfIdx !== undefined && currentBfIdx > (serverData.api.lastBackfillIndex || 0)) {
-                    API_CONFIG.lastBackfillIndex = currentBfIdx;
-                }
-                if (currentBigSumIdx !== undefined && currentBigSumIdx > (serverData.api.lastBigSummaryIndex || 0)) {
-                    API_CONFIG.lastBigSummaryIndex = currentBigSumIdx; // ✅ 恢复大总结指针
-                }
+                API_CONFIG.lastSummaryIndex = currentSumIdx || 0;
+                API_CONFIG.lastBackfillIndex = currentBfIdx || 0;
+                API_CONFIG.lastBigSummaryIndex = currentBigSumIdx || 0;
 
                 // ✅ 新增恢复：恢复总结来源（防止全局配置覆盖当前会话的独立设置）
                 if (currentSumSrc !== undefined) {
@@ -12600,177 +12792,7 @@ updateRow(1, 0, {4: "王五销毁了图纸..."})
                     const mg = x.chat[i];
                     if (!mg) return; // 消息可能被删了
 
-                    // 🛡️ 重复渲染拦截：同一楼层 + 同一分支 + 同一内容，不重复回滚/写表
-                    const currentSignature = buildMessageProcessSignature(mg);
-                    if (!window.Gaigai.isSwiping && processedMessageSignatures[msgKey] === currentSignature) {
-                        console.log(`⏭️ [重复渲染拦截] 第 ${i} 楼签名未变化，跳过重复处理（兼容二次请求插件）`);
-                        return;
-                    }
-                    processedMessageSignatures[msgKey] = currentSignature;
-
-                    console.log(`⚡ [核心计算] 开始处理第 ${i} 楼 (Swipe: ${mg.swipe_id || 0})`);
-
-
-                    // ============================================================
-                    // 步骤 1: 回滚到基准线 (Base State)
-                    // 逻辑：第N楼的状态 = 第N-1楼的快照 + 第N楼的新指令
-                    // ============================================================
-                    if (C.enabled && !C.autoBackfill) {
-                        let baseIndex = i - 1;
-                        let baseKey = null;
-
-                        // 倒序查找最近的一个有效存档（最远找到 -1 创世快照）
-                        while (baseIndex >= -1) {
-                            const key = baseIndex.toString();
-                            if (snapshotHistory[key]) {
-                                baseKey = key;
-                                break;
-                            }
-                            baseIndex--;
-                        }
-
-                        // 🛡️ 基准快照检查
-                        if (baseKey) {
-                            // 🛡️ [防清空补丁] 如果找到的是创世快照(-1)，但当前已经是聊天中途(i > 2)，
-                            // 说明中间快照丢失（通常是刷新后）。此时绝对禁止回滚到空状态，必须信任当前加载的数据。
-                            if (baseKey === '-1' && i > 2) {
-                                console.warn(`🛑 [智能保护] 第 ${i} 楼缺失前序快照，禁止回滚到创世快照(-1)，保留当前内存数据作为基准。`);
-                                // 不执行 restoreSnapshot，直接使用当前 m.s 中的数据
-                            } else {
-                                // 🛡️ [智能保护] 深度内容比较，区分"数据加载"和"用户修改"
-                                const snapshot = snapshotHistory[baseKey];
-                                if (snapshot && snapshot.data) {
-                                    // 🚩 [Swipe模式检测] 优先检查Swipe标志
-                                    if (window.Gaigai.isSwiping) {
-                                        // Swipe操作：用户明确想要撤销，强制回滚，无视所有智能保护
-                                        console.log(`↔️ [Swipe模式] 检测到 Swipe 标志，强制对齐基准快照 [${baseKey}] (无视智能保护)`);
-                                        restoreSnapshot(baseKey, true); // Force=true 跳过时间戳保护
-                                        window.Gaigai.isSwiping = false; // 重置标志，防止影响后续正常消息
-                                    } else {
-                                        // 正常模式：应用智能保护逻辑
-                                        // 1. 计算内容哈希值
-                                        const currentHash = calculateTableHash(m.s.slice(0, -1)); // 排除总结表
-                                        const snapshotHash = calculateTableHash(snapshot.data);
-
-                                        // 2. 逻辑判断
-                                        if (currentHash === snapshotHash) {
-                                            // 情况A: 内容完全一致
-                                            // 即使行数>0，也说明当前状态与快照完全匹配
-                                            // 可以安全回滚（例如Swipe/重新生成场景）
-                                            restoreSnapshot(baseKey);
-                                            console.log(`↺ [同步] 内容一致(Hash匹配)，正常回滚至快照 [${baseKey}]`);
-                                        } else {
-                                            // 情况B: 内容不同
-                                            // 检查行数以判断用户意图
-                                            const snapshotRows = snapshot.data.reduce((acc, s) => acc + (s.r ? s.r.length : 0), 0);
-                                            const currentRows = m.s.reduce((acc, s) => acc + (s.r ? s.r.length : 0), 0);
-
-                                            if (currentRows > snapshotRows) {
-                                                // FIX: If it is a swipe (swipe_id > 0), force rollback because the extra rows are likely from the previous AI generation, not user input.
-                                                if (mg.swipe_id && mg.swipe_id > 0) {
-                                                    console.log(`↺ [同步-Swipe修正] 检测到 Swipe 重生成 (id:${mg.swipe_id})，强制回滚前次生成的数据`);
-                                                    restoreSnapshot(baseKey, true);
-                                                } else {
-                                                    // Original protection logic
-                                                    // 用户可能手动导入了数据或添加了行
-                                                    console.warn(`🛑 [智能保护] 检测到数据变更(Hash不同)且行数增加 (${currentRows} > ${snapshotRows})。视为用户手动导入，取消回滚。`);
-                                                    saveSnapshot(baseKey);
-                                                }
-                                            } else if (currentRows === snapshotRows) {
-                                                // 用户可能编辑了单元格内容
-                                                console.warn(`🛑 [智能保护] 检测到数据变更(Hash不同)但行数不变 (${currentRows} 行)。视为用户编辑单元格，取消回滚。`);
-                                                saveSnapshot(baseKey);
-                                            } else {
-                                                // 当前 < 快照（用户手动删除了行？或Swipe？）
-                                                // 为确保AI同步，允许回滚
-                                                restoreSnapshot(baseKey);
-                                                console.log(`↺ [同步] 数据减少 (${currentRows} < ${snapshotRows})，执行回滚以同步状态`);
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    // 快照数据不存在，执行正常回滚
-                                    restoreSnapshot(baseKey);
-                                    console.log(`↺ [同步] 基准重置成功：已回滚至快照 [${baseKey}]`);
-                                }
-                            }
-                        } else {
-                            // [新增] 熔断机制：如果是非第一条消息且找不到基准快照，禁止继续写入
-                            // 这通常发生在重Roll时丢失了上一个状态，继续写入会导致数据重复叠加
-                            if (i > 0) {
-                                console.error(`🛑 [熔断] 第 ${i} 楼找不到前序快照，已停止自动写入以防止数据污染/重复。`);
-                            }
-                        }
-
-                        // ============================================================
-                        // 步骤 2-3: 读取和解析指令 (仅AI消息)
-                        // 用户消息跳过此步骤，直接保存快照
-                        // ============================================================
-                        if (!isUserMessage) {
-                            // 获取当前显示的文本 (强制读取 swipes 里的对应分支)
-                            const swipeId = mg.swipe_id ?? 0;
-                            let tx = '';
-                            if (mg.swipes && mg.swipes.length > swipeId) {
-                                tx = mg.swipes[swipeId];
-                            } else {
-                                tx = mg.mes || ''; // 兜底
-                            }
-
-                            // 解析并执行指令
-                            const cs = prs(tx);
-                            if (cs.length > 0) {
-                                console.log(`⚡ [写入] 识别到 ${cs.length} 条指令，正在写入表格...`);
-                                exe(cs);
-                                m.save(false, true); // 立即保存到本地存储（AI 生成的新记忆非常重要）
-
-                                // ✅ [修复] 实时填表只更新填表指针，不更新总结指针
-                                // 原因：实时填表不应该阻止自动总结触发，两者是独立的功能
-                                API_CONFIG.lastBackfillIndex = i;
-                                localStorage.setItem(AK, JSON.stringify(API_CONFIG));
-
-                                // ✅ 同步到云端，防止 loadConfig 回滚
-                                if (typeof saveAllSettingsToCloud === 'function') {
-                                    saveAllSettingsToCloud().catch(err => {
-                                        console.warn('⚠️ [实时填表] 云端同步失败:', err);
-                                    });
-                                }
-
-                                console.log(`✅ [实时填表] 填表指针已更新至第 ${i} 楼`);
-                            } else {
-                                console.log(`Testing: 第 ${i} 楼无指令，保持基准状态。`);
-                            }
-                        } else {
-                            // 用户消息：不解析指令，只保存当前状态作为快照
-                            console.log(`👤 [用户消息] 第 ${i} 楼为用户消息，跳过指令解析，仅保存快照`);
-                        }
-
-                        // ============================================================
-                        // 步骤 4: 生成当前楼层的新快照 (Save Snapshot i)
-                        // 这样第 i+1 楼就能用这个作为基准了
-                        // ============================================================
-                        const newSnapshot = {
-                            data: m.all().slice(0, -1).map(sh => JSON.parse(JSON.stringify(sh.json()))), // 只保存数据表
-                            summarized: JSON.parse(JSON.stringify(summarizedRows)),
-                            timestamp: Date.now()
-                        };
-                        snapshotHistory[msgKey] = newSnapshot;
-                        console.log(`📸 [快照] 第 ${i} 楼的新状态已封存。`);
-
-                        cleanOldSnapshots();
-                    }
-
-                    // 🆕 [修复3] 确保在所有模式下都保存快照
-                    // 如果上面的实时填表模式没有执行（因为 C.autoBackfill = true），这里补充保存
-                    if (C.enabled && C.autoBackfill && !snapshotHistory[msgKey]) {
-                        const newSnapshot = {
-                            data: m.all().slice(0, -1).map(sh => JSON.parse(JSON.stringify(sh.json()))),
-                            summarized: JSON.parse(JSON.stringify(summarizedRows)),
-                            timestamp: Date.now()
-                        };
-                        snapshotHistory[msgKey] = newSnapshot;
-                        console.log(`📸 [快照-补充] 第 ${i} 楼的新状态已封存（自动批量填表模式）。`);
-                        cleanOldSnapshots();
-                    }
+                    syncMemoryHistory(true);
 
                     // 🚦 标志位
                     let hasBackfilledThisTurn = false;
@@ -13058,221 +13080,39 @@ updateRow(1, 0, {4: "王五销毁了图纸..."})
     // 1. 聊天状态变更监听 (修复删楼、分支切换、多重宇宙逻辑)
     // ============================================================
     async function ochat() {
-        // 🔒 性能优化：加锁，防止切换期间误操作
+        const revision = ++chatSwitchRevision;
+        const session = m.gid();
         isChatSwitching = true;
-
-        // 🧹 [清理] 切换会话时，清除所有挂起的写入任务
-        Object.keys(pendingTimers).forEach(key => {
-            clearTimeout(pendingTimers[key]);
-            delete pendingTimers[key];
-        });
-        processedMessageSignatures = {};
-        console.log('🔒 [ochat] 会话切换锁已启用');
-
-        // ✨ [防串味] 重置世界书状态
-        if (window.Gaigai && window.Gaigai.WI && typeof window.Gaigai.WI.resetState === 'function') {
-            window.Gaigai.WI.resetState();
-        }
-
-        // 🛡️🛡️🛡️ [防串味核心修复] 强制清空所有运行时状态
-        // 不依赖 m.load() 内部判断，直接在入口处暴力重置
-        console.log('🧹 [防串味] 正在强制清空当前会话数据，防止残留...');
-
-        // 1. 💾 [暂存旧会话] 切换前，把旧会话的快照存入仓库
-        if (m.id) {
-            window.GaigaiSnapshotStore[m.id] = snapshotHistory;
-            console.log(`💾 [防串味] 已暂存旧会话 [${m.id}] 的快照`);
-        }
-
-        // 2. 强制重置内存状态（防止串味的关键）
-        m.id = null;
-        const tableDef = (C.customTables && Array.isArray(C.customTables) && C.customTables.length > 0)
-            ? C.customTables
-            : DEFAULT_TABLES;
-        m.s = tableDef.map(t => new S(t.n, t.c));
+        historyEpoch++;
+        Object.values(pendingTimers).forEach(clearTimeout);
+        pendingTimers = {};
+        clearTimeout(saveChatDebounceTimer);
+        saveChatDebounceTimer = null;
+        window.Gaigai.WI?.resetState();
+        memoryHistory = null;
         snapshotHistory = {};
-        summarizedRows = {};
-        userColWidths = {};
-        userRowHeights = {};
-        API_CONFIG.lastSummaryIndex = 0;
-        API_CONFIG.lastBackfillIndex = 0;
+        processedMessageSignatures = {};
+        processedMessages.clear();
+        m.id = null;
         lastInternalSaveTime = 0;
-        console.log('✅ [防串味] 内存状态已完全清空');
-
-        // 3. 清空 UI，显示加载状态
-        if ($('#gai-main-pop').length > 0) {
-            console.log('🎨 [防串味] 正在清空 UI，显示加载状态...');
-            shw(); // 刷新为空表格
-        }
-
-        // 4. 延迟加载，等待 SillyTavern 上下文完全切换
-        setTimeout(async () => {
-            console.log('⏳ [防串味] 延迟结束，开始加载新会话数据...');
-
-            // 5. 验证上下文是否有效
-            const ctx = m.ctx();
-            if (!ctx || !ctx.chatId) {
-                console.warn('⚠️ [防串味] 上下文无效或 chatId 不存在，跳过加载');
-                isChatSwitching = false;
-                return;
-            }
-
-            // 6. 加载全局配置
-            try { await loadConfig(); } catch (e) { }
-
-            // 7. 🔄 [加载新会话]
-            m.load(); // 这会更新 m.id 和从硬盘读取最新的 m.s 数据
-            thm();
-
-            // 8. 重置运行时状态
+        try {
+            await loadConfig();
+            if (revision !== chatSwitchRevision || session !== m.gid()) return;
+            m.load();
             window.Gaigai.foldOffset = 0;
             window.Gaigai.lastRequestData = null;
-            lastProcessedMsgIndex = -1;
-            isRegenerating = false;
-            deletedMsgIndex = -1;
-            processedMessages.clear();
-            processedMessageSignatures = {};
-
-            // 9. 📂 [恢复快照库] 从仓库取出新会话的快照
-            if (m.id && window.GaigaiSnapshotStore[m.id]) {
-                snapshotHistory = window.GaigaiSnapshotStore[m.id];
-                console.log(`📂 [ochat] 已恢复会话 [${m.id}] 的内存快照`);
-            } else {
-                snapshotHistory = {};
-                // 🔥 [新增] 如果内存仓库为空，尝试从 localStorage 恢复持久化的快照
-                loadSnapshots();
-            }
-
-            // 10. 🧹 [内存清理]
-            const allKeys = Object.keys(snapshotHistory).map(Number).filter(k => !isNaN(k)).sort((a, b) => a - b);
-            if (allKeys.length > 50) {
-                const cutoff = allKeys[allKeys.length - 50];
-                allKeys.forEach(k => {
-                    if (k < cutoff && k !== -1) delete snapshotHistory[k.toString()];
-                });
-            }
-
-            // 11. 🛡️ [创世快照兜底]
-            // FIX: Always initialize Genesis snapshot with currently loaded data (m.s),
-            // ensuring it's not empty if we just reloaded an existing chat.
-            if (!snapshotHistory['-1']) {
-                snapshotHistory['-1'] = {
-                    data: m.all().slice(0, -1).map(sh => JSON.parse(JSON.stringify(sh.json()))),
-                    summarized: JSON.parse(JSON.stringify(summarizedRows)),
-                    timestamp: 0
-                };
-                console.log("📸 [Genesis Snapshot] Initialized with loaded data (Rows: " +
-                    m.s.reduce((acc, s) => acc + (s.r ? s.r.length : 0), 0) + ")");
-            }
-
-            // ============================================================
-            // ⚡⚡⚡ [核心修复：分支穿越/时光机逻辑] ⚡⚡⚡
-            // ============================================================
-            const currentLen = ctx && ctx.chat ? ctx.chat.length : 0;
-            console.log(`📂 [ochat] 检测到聊天/分支变更 (当前楼层: ${currentLen})`);
-
-            if (currentLen > 0) {
-                // 目标：我们应该处于哪一楼的状态？
-                const targetIndex = currentLen - 1;
-                const targetKey = targetIndex.toString();
-
-                // 策略 A：如果我们有这一楼的快照（说明是切回了已存在的分支）
-                if (snapshotHistory[targetKey]) {
-                    // ✅ 增加模式判断：批量填表模式下不回滚
-                    if (C.enabled && !C.autoBackfill) {
-                        console.log(`⚡ [ochat] 检测到已知分支，正在回档至 [${targetKey}]...`);
-                        restoreSnapshot(targetKey, true);
-                    } else {
-                        console.log(`⏭️ [ochat] 当前为批量/非实时模式，跳过分支回档保护数据。`);
-                    }
-                }
-                // 策略 B：如果没有这一楼的快照（说明可能是刚加载，或者快照丢了）
-                // 我们尝试找找上一楼的，或者相信 m.load() 从硬盘读出来的数据
-                else {
-                    console.log(`⚠️ [ochat] 未找到分支快照 [${targetKey}]，尝试使用硬盘存档数据并建立新快照`);
-                    // 立即为当前状态建立一个快照，防止下次切回来又空了
-                    saveSnapshot(targetKey);
-
-                    // FIX: If genesis snapshot is empty but we loaded data from disk, sync genesis to prevent wipe on swipe.
-                    const snapMinus1 = snapshotHistory['-1'];
-                    const snapTarget = snapshotHistory[targetKey];
-                    if (snapMinus1 && snapTarget && snapTarget.data) {
-                        const targetHasData = snapTarget.data.some(s => s.r && s.r.length > 0);
-                        const minus1Empty = snapMinus1.data.every(s => !s.r || s.r.length === 0);
-
-                        if (targetHasData && minus1Empty) {
-                            console.log('🛡️ [ochat-Patch] Detected imported data with empty genesis. Syncing snapshot -1.');
-                            snapshotHistory['-1'] = JSON.parse(JSON.stringify(snapTarget));
-                            snapshotHistory['-1'].timestamp = 0; // Keep it as genesis
-                        }
-                    }
-                }
-            } else {
-                // 如果是新开聊天（0楼）
-                // 🛑 【逻辑修正】绝对信任硬盘存档 (m.load)
-                // 无论刚才读出来的是有数据还是没数据(用户删空了)，那都是最新的状态。
-                // 我们必须强制让内存里的快照(-1)同步成现在的样子。
-                // 严禁在这里执行 restoreSnapshot，否则会把用户"特意删空"的状态当作"数据丢失"给回滚掉。
-
-                saveSnapshot('-1');
-                console.log(`💾 [ochat] 0楼状态同步：已将内存快照-1强制更新为硬盘存档状态`);
-            }
-
-            // 刷新 UI
-            setTimeout(hideMemoryTags, 500);
-            setTimeout(() => {
-                // 强制刷新表格视图
-                if ($('#gai-main-pop').length > 0) {
-                    const activeTab = $('.g-t.act').data('i');
-                    if (activeTab !== undefined) refreshTable(activeTab);
-                }
-            }, 650);
-
-            // ============================================================
-            // 🚑 [开场白修复补丁 - 增强版]
-            // 检查并强制处理未被快照的开场白消息
-            // ============================================================
-            if (currentLen > 0) {
-                const firstMsg = ctx.chat[0];
-
-                // 🆕 [修复1] 检查第 0 楼快照是否存在
-                if (!snapshotHistory['0']) {
-                    console.log('🚑 [开场白补丁] 检测到缺失第 0 楼快照');
-
-                    // 情况A：如果是新开局（只有1条消息且是AI发的）
-                    if (currentLen === 1 && firstMsg && firstMsg.is_user === false) {
-                        console.log('🚑 [补丁A] 新开局场景，立即生成第 0 楼快照');
-                        // 立即调用 saveSnapshot 而不是 omsg，避免延迟
-                        saveSnapshot('0');
-                    }
-                    // 情况B：已有聊天记录但缺失快照（可能是刷新后）
-                    else if (currentLen > 1) {
-                        console.log('🚑 [补丁B] 已有聊天记录但缺失第 0 楼快照，尝试补录');
-
-                        // 如果第 0 楼是 AI 发的，调用 omsg 处理
-                        if (firstMsg && firstMsg.is_user === false) {
-                            omsg(0);
-                        }
-                        // 如果第 0 楼是 User 发的，那么第 0 楼的基准应该是空表（-1）
-                        else {
-                            console.log('🚑 [补丁B] 第 0 楼是 User 发的，基准状态应为空表');
-                            // 将 -1 快照复制为 0 快照
-                            if (snapshotHistory['-1']) {
-                                snapshotHistory['0'] = JSON.parse(JSON.stringify(snapshotHistory['-1']));
-                                console.log('✅ [补丁B] 已将创世快照复制为第 0 楼快照');
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 解锁
-            setTimeout(() => {
+            lastManualEditTime = 0;
+            window.lastManualEditTime = 0;
+            thm();
+        } finally {
+            if (revision === chatSwitchRevision) {
                 isChatSwitching = false;
-            }, 800);
-
-            console.log('✅ [防串味] 新会话加载完成');
-        }, 200); // 延迟 200ms，等待 SillyTavern 上下文完全切换
+                if (session === m.gid() && memoryHistory) {
+                    syncMemoryHistory(true);
+                    setTimeout(hideMemoryTags, 100);
+                }
+            }
+        }
     }
 
     // ============================================================
@@ -13630,6 +13470,7 @@ updateRow(1, 0, {4: "王五销毁了图纸..."})
      * @returns {Promise<string>} - 返回向量检索结果文本（用于 Fetch Hijack 热替换）
      */
     async function executeVectorSearch(data) {
+        const historyToken = captureHistoryToken();
         let vectorContent = ''; // 默认返回空字符串
 
         try {
@@ -13824,6 +13665,7 @@ updateRow(1, 0, {4: "王五销毁了图纸..."})
                 console.log('🚫 [向量检索] 跳过：功能未启用');
             }
 
+            if (!isHistoryTokenCurrent(historyToken)) return '';
             // 返回向量内容（用于 Fetch Hijack 热替换）
             return vectorContent;
 
@@ -13844,6 +13686,7 @@ updateRow(1, 0, {4: "王五销毁了图纸..."})
         // 🔴 全局主开关守卫
         if (!C.masterSwitch) return;
 
+        let promptMemoryState = null;
         try {
             const data = ev.detail || ev;
             if (!data) return;
@@ -13854,193 +13697,12 @@ updateRow(1, 0, {4: "王五销毁了图纸..."})
             const globalCtx = m.ctx();
             const globalChat = globalCtx ? globalCtx.chat : null;
 
-            if (C.enabled && !C.autoBackfill && globalChat && globalChat.length > 0) {
-                let targetIndex = globalChat.length;
-                const lastMsg = globalChat[globalChat.length - 1];
-
-                // 判断是 新生成 还是 重Roll
-                if (lastMsg && !lastMsg.is_user) {
-                    targetIndex = globalChat.length - 1; // 重Roll当前最后一条 AI 消息
-                    console.log(`♻️ [opmt] 检测到重Roll (目标层: ${targetIndex})`);
-                } else {
-                    console.log(`🆕 [opmt] 检测到新消息 (目标层: ${targetIndex})`);
-                }
-
-                const targetKey = targetIndex.toString();
-
-                // 2.5 🆕 [补充快照] 如果上一楼是用户消息且没有快照，为它创建快照
-                const prevIndex = targetIndex - 1;
-                if (prevIndex >= 0) {
-                    const prevMsg = globalChat[prevIndex];
-                    const prevKey = prevIndex.toString();
-
-                    if (prevMsg && prevMsg.is_user && !snapshotHistory[prevKey]) {
-                        // 为用户消息创建快照（保存当前表格状态）
-                        const userSnapshot = {
-                            data: m.all().slice(0, -1).map(sh => JSON.parse(JSON.stringify(sh.json()))),
-                            summarized: JSON.parse(JSON.stringify(summarizedRows)),
-                            timestamp: Date.now()
-                        };
-                        snapshotHistory[prevKey] = userSnapshot;
-                        console.log(`📸 [opmt-补充] 为用户消息第 ${prevIndex} 楼创建快照`);
-                    }
-                }
-
-                // 2. 🔍 寻找基准快照 (上一楼的状态)
-                let baseIndex = targetIndex - 1;
-                let baseKey = null;
-
-                while (baseIndex >= -1) {
-                    const key = baseIndex.toString();
-                    if (snapshotHistory[key]) {
-                        baseKey = key;
-                        break;
-                    }
-                    baseIndex--;
-                }
-
-                // 3. ⏪ [核心步骤] 发送请求前，强制回滚表格！
-                if (baseKey) {
-                    // ✅ [安全补丁] 如果只找到了创世快照(-1)，但当前楼层较高(>5)...
-                    if (baseKey === '-1' && targetIndex > 5) {
-                        console.warn(`🛑 [安全拦截] 楼层 ${targetIndex} 较高且缺失中间快照，禁止回滚到初始状态，保持当前数据。`);
-                    } else {
-                        // 🛡️ [智能保护] 深度内容比较，区分"数据加载"和"用户修改"
-                        const snapshot = snapshotHistory[baseKey];
-                        if (snapshot && snapshot.data) {
-                            // 1. 计算内容哈希值
-                            const currentHash = calculateTableHash(m.s.slice(0, -1)); // 排除总结表
-                            const snapshotHash = calculateTableHash(snapshot.data);
-
-                            // 2. 🆕 检查"目标快照"（当前消息上一次生成后的状态）
-                            // 如果我们正在重新生成消息N，检查当前表格是否与快照N一致
-                            const targetSnapshot = snapshotHistory[targetKey];
-                            let isCleanAIOutput = false;
-                            if (targetSnapshot && targetSnapshot.data) {
-                                const targetHash = calculateTableHash(targetSnapshot.data);
-                                if (currentHash === targetHash) {
-                                    isCleanAIOutput = true;
-                                    console.log(`♻️ [opmt] 检测到当前状态与目标快照 [${targetKey}] 一致 (未被用户修改)，允许回滚。`);
-                                }
-                            }
-
-                            // 3. 逻辑判断
-                            if (currentHash === snapshotHash) {
-                                // 情况A: 与基准快照一致（安全）
-                                restoreSnapshot(baseKey, true);
-                                console.log(`↺ [opmt] 内容一致(Hash匹配)，正常回滚至基准 [${baseKey}]`);
-                                // FIX: Immediately refresh UI when rolling back state in opmt
-                                if ($('#gai-main-pop').length > 0) {
-                                    const activeTab = $('.g-t.act').data('i');
-                                    if (activeTab !== undefined) {
-                                        refreshTable(activeTab);
-                                        console.log('🔄 [opmt] Visual state refreshed immediately.');
-                                    }
-                                }
-                            } else if (isCleanAIOutput) {
-                                // 情况B: 与上一轮AI输出一致（安全，可以撤销）
-                                restoreSnapshot(baseKey, true);
-                                console.log(`↺ [opmt] 撤销上一轮AI生成内容，回滚至基准 [${baseKey}]`);
-                                // FIX: Immediately refresh UI when rolling back state in opmt
-                                if ($('#gai-main-pop').length > 0) {
-                                    const activeTab = $('.g-t.act').data('i');
-                                    if (activeTab !== undefined) {
-                                        refreshTable(activeTab);
-                                        console.log('🔄 [opmt] Visual state refreshed immediately.');
-                                    }
-                                }
-                            } else {
-                                // 情况C: 被用户修改（保护）
-                                const snapRows = snapshot.data.reduce((acc, s) => acc + (s.r ? s.r.length : 0), 0);
-                                const currentRows = m.s.reduce((acc, s) => acc + (s.r ? s.r.length : 0), 0);
-
-                                if (currentRows > snapRows) {
-                                    // 用户可能手动导入了数据或添加了行
-                                    console.warn(`🛑 [智能保护/opmt] 检测到用户手动修改(Hash不同且非AI原样)。保留当前数据，更新基准快照。`);
-                                    saveSnapshot(baseKey);
-                                } else if (currentRows === snapRows) {
-                                    // 用户可能编辑了单元格内容
-                                    console.warn(`🛑 [智能保护/opmt] 检测到单元格编辑。保留当前数据，更新基准快照。`);
-                                    saveSnapshot(baseKey);
-                                } else {
-                                    // 当前 < 快照（用户手动删除了行？或Swipe？）
-                                    // 为确保AI同步，允许回滚
-                                    restoreSnapshot(baseKey, true);
-                                    console.log(`↺ [opmt] 数据减少 (${currentRows} < ${snapRows})，执行回滚以同步状态`);
-                                    // FIX: Immediately refresh UI when rolling back state in opmt
-                                    if ($('#gai-main-pop').length > 0) {
-                                        const activeTab = $('.g-t.act').data('i');
-                                        if (activeTab !== undefined) {
-                                            refreshTable(activeTab);
-                                            console.log('🔄 [opmt] Visual state refreshed immediately.');
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            // 快照数据不存在，执行正常回滚
-                            restoreSnapshot(baseKey, true);
-                            console.log(`↺ [opmt] 成功回档: 表格已恢复至基准 [${baseKey}]`);
-                            // FIX: Immediately refresh UI when rolling back state in opmt
-                            if ($('#gai-main-pop').length > 0) {
-                                const activeTab = $('.g-t.act').data('i');
-                                if (activeTab !== undefined) {
-                                    refreshTable(activeTab);
-                                    console.log('🔄 [opmt] Visual state refreshed immediately.');
-                                }
-                            }
-                        }
-                    }
-                } else if (baseIndex === -1 && snapshotHistory['-1']) {
-                    // 🛡️ [终极防御] 检查当前内存中是否已有数据
-                    // 如果当前详情表有数据(行数>0)，但系统试图回滚到空快照(-1)，这绝对是误判！
-                    // 此时必须信任当前内存数据，将其反向同步给快照，而不是清空数据。
-                    const hasData = m.s.slice(0, -1).some(s => s.r && s.r.length > 0);
-
-                    if (hasData) {
-                        console.warn(`🛑 [opmt] 致命拦截：检测到试图将有效数据回滚到空快照(-1)！`);
-                        console.warn(`🔧 [opmt] 自动修正：将当前内存数据强制确立为新的基准快照(-1)。`);
-
-                        // 修正快照 -1
-                        snapshotHistory['-1'] = {
-                            data: m.all().slice(0, -1).map(sh => JSON.parse(JSON.stringify(sh.json()))),
-                            summarized: JSON.parse(JSON.stringify(summarizedRows)),
-                            timestamp: Date.now()
-                        };
-                    } else {
-                        // 只有当当前真的是空的，或者楼层极低时，才允许回滚到创世快照
-                        if (targetIndex > 5) {
-                            console.warn(`🛑 [安全拦截] 楼层 ${targetIndex} 较高但只有创世快照，禁止回滚，保持当前数据。`);
-                        } else {
-                            restoreSnapshot('-1', true);
-                            console.log(`↺ [opmt] 成功回档: 表格已恢复至创世状态`);
-                            // FIX: Immediately refresh UI when rolling back state in opmt
-                            if ($('#gai-main-pop').length > 0) {
-                                const activeTab = $('.g-t.act').data('i');
-                                if (activeTab !== undefined) {
-                                    refreshTable(activeTab);
-                                    console.log('🔄 [opmt] Visual state refreshed immediately.');
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // ⚠️ 如果实在找不到存档，为了防止脏数据污染 Prompt，这里选择不做操作(保持现状)或清空
-                    // 根据用户要求：保持现状可能导致AI不输出标签，但清空可能丢失手动数据。
-                    // 由于 ochat 修复了快照链，理论上这里一定能找到 baseKey。
-                    console.warn(`⚠️ [opmt] 警告: 未找到基准快照，将发送当前表格。`);
-                }
-
-                // 4. 🗑️ 销毁脏快照 (当前正在生成的这一楼的旧存档)
-                if (snapshotHistory[targetKey]) {
-                    delete snapshotHistory[targetKey];
-                    console.log(`🗑️ [opmt] 已销毁旧的 [${targetKey}] 楼快照`);
-                }
-
-                if (pendingTimers[targetKey]) {
-                    clearTimeout(pendingTimers[targetKey]);
-                    delete pendingTimers[targetKey];
-                }
+            if (isChatSwitching || m.id !== m.gid()) return;
+            syncMemoryHistory();
+            // Keep the saved state intact if generation is cancelled or fails.
+            if (C.enabled && !C.autoBackfill && globalChat?.length && !globalChat[globalChat.length - 1].is_user) {
+                promptMemoryState = captureMemoryState();
+                applyMemoryState(memoryHistory.view(window.Gaigai.History.prefixes(globalChat.slice(0, -1))));
             }
 
             isRegenerating = false;
@@ -14093,6 +13755,8 @@ updateRow(1, 0, {4: "王五销毁了图纸..."})
 
         } catch (e) {
             console.error('❌ opmt 错误:', e);
+        } finally {
+            if (promptMemoryState) applyMemoryState(promptMemoryState);
         }
     }
 
@@ -14110,6 +13774,15 @@ updateRow(1, 0, {4: "王五销毁了图纸..."})
             console.log('⏳ [Gaigai] Waiting for dependencies...');
             setTimeout(ini, 500);
             return;
+        }
+
+        if (!window.Gaigai.History) {
+            try { await $.getScript(`${EXTENSION_PATH}/memory_history.js`); }
+            catch (error) {
+                console.error('[Memory History] Required journal module failed to load', error);
+                if (typeof toastr !== 'undefined') toastr.error('操作历史模块加载失败，记忆插件已暂停初始化，请刷新重试。');
+                return;
+            }
         }
 
         // ✨✨✨ 核心修改：精准定位顶部工具栏 ✨✨✨
@@ -14161,6 +13834,7 @@ updateRow(1, 0, {4: "王五销毁了图纸..."})
         const ctx = SillyTavern.getContext();
         if (ctx && ctx.chatId) {
             m.load();
+            syncMemoryHistory(true);
         }
 
         thm();
@@ -14730,146 +14404,40 @@ updateRow(1, 0, {4: "王五销毁了图纸..."})
                     }
                 }
                 // ============================================================
-                // 监听 Swipe 事件 (切换回复)
-                x.eventSource.on(x.event_types.MESSAGE_SWIPED, function (id) {
-                    // 🛡️[Swipe拦截] 忽略酒馆初始化/加载聊天时自动触发的假 Swipe
-                    if (typeof isChatSwitching !== 'undefined' && isChatSwitching) {
-                        console.log('🛡️ [Swipe拦截] 会话正在加载中，忽略初始化触发的假分支切换。');
-                        return;
-                    }
-
-                    console.log(`↔️ [Swipe触发] 第 ${id} 楼正在切换分支...`);
-
-                    // 🚩 设置Swipe标志，通知后续的omsg跳过智能保护
-                    window.Gaigai.isSwiping = true;
-
-                    const key = id.toString();
-
-                    // 1. 🛑 [第一步：立即刹车] 清除该楼层正在进行的任何写入计划
-                    if (pendingTimers[key]) {
-                        clearTimeout(pendingTimers[key]);
-                        delete pendingTimers[key];
-                        console.log(`🛑 [Swipe] 已终止第 ${id} 楼的挂起任务`);
-                    }
-
-                    // 2. ⏪ [第二步：时光倒流] 强制回滚到上一楼的状态
-                    const prevKey = (id - 1).toString();
-
-                    // Determine the base snapshot to rollback to
-                    let targetBaseKey = null;
-                    if (snapshotHistory[prevKey]) {
-                        targetBaseKey = prevKey;
-                    } else if (id === 0 && snapshotHistory['-1']) {
-                        targetBaseKey = '-1';
-                    }
-
-                    if (targetBaseKey) {
-                        // ✅ 核心修复：只有在开启实时填表且非批量填表时，才允许 Swipe 回档
-                        if (C.enabled && !C.autoBackfill) {
-                            restoreSnapshot(targetBaseKey, true);
-                            console.log(`↺ [Swipe] 成功强制回档至基准线: 快照[${targetBaseKey}]`);
-                        } else {
-                            console.log(`⏭️ [Swipe] 当前为批量/非实时模式，跳过快照回档以保护表格数据。`);
-                        }
-                    } else {
-                        console.warn(`⚠️ [Swipe] 警告: 找不到上一楼的快照，无法回滚。`);
-                    }
-
-                    // 3. 🗑️ [第三步：清理现场] 销毁当前楼层的旧快照 (Dirty Snapshot)
-                    // 这迫使 omsg 重新计算并保存新的快照
-                    if (snapshotHistory[key]) {
-                        delete snapshotHistory[key];
-                        console.log(`🗑️ [Swipe] 已销毁第 ${id} 楼的旧分支快照`);
-                    }
-                    delete processedMessageSignatures[key];
-
-                    // 4. 💾 [第四步：立即持久化]
-                    m.save(true, true);
-                    console.log(`💾 [Swipe] 已立即保存回滚后的状态到 localStorage`);
-
-                    // 5. 🔄 [第五步：立即刷新 UI]
-                    if ($('#gai-main-pop').length > 0) {
-                        const activeTab = $('.g-t.act').data('i');
-                        if (activeTab !== undefined) {
-                            refreshTable(activeTab);
-                            console.log(`🔄 [Swipe] 已刷新活动标签页 [${activeTab}]`);
-                        }
-                        // Update tab counts
-                        m.s.slice(0, -1).forEach((_, i) => updateTabCount(i));
-                        console.log(`🔄 [Swipe] 已更新所有标签页计数`);
-                    }
-
-                    // 6. ▶️ [第六步：重新读取当前分支]
-                    // 关键！延迟一小段时间后，重新读取当前显示的 Swipe 内容并执行。
-                    // 如果是新生成(Regenerate)，这里读到的可能是空，但在生成结束后会有 CHARACTER_MESSAGE_RENDERED 再次触发。
-                    // 如果是切回旧分支(Swap)，这里会读到旧分支的内容并恢复表格。
-                    setTimeout(() => {
-                        console.log(`▶️ [Swipe] 重新计算当前分支内容...`);
-                        omsg(id);
-                    }, 200); // 给 200ms 缓冲，确保 DOM 已经切换完成
-
-                    console.log(`✅ [Swipe] 回滚流程执行完毕，等待新生成...`);
-                });
-
-                // ✅✅✅ [暴力修复] 直接监听 DOM 点击事件，确保 Swipe 立即触发回滚
-                $(document).on('click', '.swipe_left, .swipe_right', function (e) {
-                    console.log('🖱️ [DOM监听] 检测到 Swipe 按钮点击，强制启动回滚流程...');
-
-                    // 1. 设置全局标志位，通知后续的 omsg 不要拦截
-                    window.Gaigai.isSwiping = true;
-
-                    // 2. 获取当前上下文
-                    const ctx = m.ctx();
-                    if (!ctx || !ctx.chat || ctx.chat.length === 0) return;
-
-                    // 3. 确定要回滚的目标（通常是当前最后一条消息的上一楼）
-                    // Swipe 实际上是重写最后一条消息，所以我们要让表格回到 "最后一条消息还没发生时" 的状态
-                    const currentId = ctx.chat.length - 1;
-                    const prevKey = (currentId - 1).toString();
-
-                    // 查找基准快照
-                    let targetBaseKey = null;
-                    if (snapshotHistory[prevKey]) {
-                        targetBaseKey = prevKey;
-                    } else if (currentId === 0 && snapshotHistory['-1']) {
-                        targetBaseKey = '-1';
-                    }
-
-                    // 4. 立即执行回滚
-                    if (targetBaseKey) {
-                        // ✅ 核心修复：同样增加模式判断
-                        if (C.enabled && !C.autoBackfill) {
-                            const success = restoreSnapshot(targetBaseKey, true);
-                            if (success) {
-                                console.log(`↺ [DOM Swipe] 已强制回滚至快照 [${targetBaseKey}]`);
+                if (x.event_types.WORLDINFO_ENTRIES_LOADED) {
+                    x.eventSource.on(x.event_types.WORLDINFO_ENTRIES_LOADED, lore => {
+                        const ready = !isChatSwitching && m.id === m.gid();
+                        if (ready) syncMemoryHistory();
+                        const expectedBook = window.Gaigai.WI?._getStableBookName(m.gid());
+                        const summaries = new Set(m.s[m.s.length - 1]?.r.map(row => String(row[1] || '').trim()));
+                        for (const entries of Object.values(lore || {})) {
+                            if (!Array.isArray(entries)) continue;
+                            for (let i = entries.length - 1; i >= 0; i--) {
+                                const entry = entries[i];
+                                const marker = entry.extensions?.gaigai_memory;
+                                const managed = marker || String(entry.world || '').startsWith('Memory_Context_');
+                                if (!managed) continue;
+                                const body = String(entry.content || '').split('\n').slice(1).join('\n').trim();
+                                if (!ready || (marker ? marker.session !== m.gid() : entry.world !== expectedBook)
+                                    || !summaries.has(body)) entries.splice(i, 1);
                             }
-                        } else {
-                            console.log(`⏭️[DOM Swipe] 当前为批量/非实时模式，跳过快照回档。`);
                         }
-                    } else {
-                        console.warn(`⚠️ [DOM Swipe] 找不到上一楼 [${prevKey}] 的快照，无法回滚`);
-                    }
+                    });
+                }
 
-                    // 5. 立即清理当前楼层的脏快照
-                    const currentKey = currentId.toString();
-                    if (snapshotHistory[currentKey]) {
-                        delete snapshotHistory[currentKey];
-                    }
-                    delete processedMessageSignatures[currentKey];
+                // ST emits MESSAGE_DELETED for real deletions and regeneration; validate content,
+                // rather than guessing intent from DOM buttons or treating the event argument as an ID.
+                const onHistoryChange = () => {
+                    if (isChatSwitching || m.id !== m.gid()) return;
+                    Object.values(pendingTimers).forEach(clearTimeout);
+                    pendingTimers = {};
+                    historyEpoch++;
+                    syncMemoryHistory();
+                };
+                for (const name of ['MESSAGE_DELETED', 'MESSAGE_EDITED', 'MESSAGE_UPDATED', 'MESSAGE_SWIPED']) {
+                    if (x.event_types[name]) x.eventSource.on(x.event_types[name], onHistoryChange);
+                }
 
-                    // 6. 立即保存并刷新 UI
-                    m.save(true, true);
-
-                    if ($('#gai-main-pop').length > 0) {
-                        const activeTab = $('.g-t.act').data('i');
-                        if (activeTab !== undefined) {
-                            refreshTable(activeTab);
-                            console.log('🔄 [DOM Swipe] UI 已刷新');
-                        }
-                    }
-                });
-
-                // 🗑️ [已删除] 自动回档监听器 (MESSAGE_DELETED) 已移除，防止重Roll时数据错乱。
 
             } catch (e) {
                 console.error('❌ 事件监听注册失败:', e);
@@ -15125,6 +14693,12 @@ updateRow(1, 0, {4: "王五销毁了图纸..."})
 
     // ✅✅✅ 直接把核心变量挂到 window.Gaigai 上 (使用 Object.assign 防止覆盖子模块)
     Object.assign(window.Gaigai, {
+        captureHistoryToken,
+        withMemoryView,
+        commitMemoryOperation,
+        memoryTablesAt,
+        isHistoryTokenCurrent,
+        syncMemoryHistory,
         v: V,
         m: m,
         shw: shw,
