@@ -222,6 +222,40 @@
             session: JSON.stringify([owner, String(ctx.chatId)]) };
     }
 
+    function cleanupDeletedChatData(chatName) {
+        const name = String(chatName || '').replace(/\.jsonl$/i, '');
+        if (!name || typeof localStorage === 'undefined') return;
+        Object.values(pendingTimers).forEach(clearTimeout);
+        pendingTimers = {};
+        if (saveChatDebounceTimer) {
+            clearTimeout(saveChatDebounceTimer);
+            saveChatDebounceTimer = null;
+        }
+        const ctx = m.ctx?.();
+        const owner = ctx?.groupId != null
+            ? `group:${ctx.groupId}`
+            : `character:${ctx?.characters?.[ctx?.characterId]?.avatar || (ctx?.characterId ?? ctx?.name2)}`;
+        const sessions = new Set();
+        for (const key of Object.keys(localStorage)) {
+            if (!key.startsWith(`${SK}_`)) continue;
+            let data;
+            try { data = JSON.parse(localStorage.getItem(key)); } catch (e) { continue; }
+            const history = data?.history;
+            if (!history || history.owner !== owner || String(history.chatName).replace(/\.jsonl$/i, '') !== name) continue;
+            sessions.add(history.session);
+            localStorage.removeItem(key);
+        }
+        for (const key of Object.keys(localStorage)) {
+            if (!key.startsWith(`${SK}_`)) continue;
+            const base = key.slice(SK.length + 1);
+            if ([...sessions].some(session => base.startsWith(`${session}_`))) localStorage.removeItem(key);
+        }
+        for (const session of sessions) {
+            try { window.Gaigai?.VM?.deleteBook?.(`summary_book_${session}`); } catch (e) { }
+        }
+        if (sessions.size) console.log(`🧹 [Memory] 已清理已删除聊天「${name}」的 ${sessions.size} 份本地记录`);
+    }
+
     function legacyChatId() {
         const ctx = m.ctx();
         const chat = ctx?.chatMetadata?.file_name || ctx?.chatId;
@@ -14060,6 +14094,18 @@ updateRow(1, 0, {4: "王五销毁了图纸..."})
 
                 // 监听对话切换事件（用于刷新数据和UI）
                 x.eventSource.on(x.event_types.CHAT_CHANGED, function () { ochat(); });
+
+                // 删除聊天时同步清理扩展缓存、历史备份和自动向量书。
+                if (x.event_types.CHAT_DELETED) {
+                    x.eventSource.on(x.event_types.CHAT_DELETED, function (chatName) {
+                        cleanupDeletedChatData(chatName);
+                    });
+                }
+                if (x.event_types.GROUP_CHAT_DELETED) {
+                    x.eventSource.on(x.event_types.GROUP_CHAT_DELETED, function (chatName) {
+                        cleanupDeletedChatData(chatName);
+                    });
+                }
 
                 // 监听提示词准备事件（用于注入记忆表格）
                 // ============================================================
